@@ -126,9 +126,6 @@ Task:
 Style requirement:
 {style_hint}
 
-User ID:
-{user_id}
-
 User history (older interactions only):
 {format_history(history)}
 
