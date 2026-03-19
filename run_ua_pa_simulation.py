@@ -10,7 +10,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from heapq import nlargest
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 from openai import OpenAI
 from config_loader import ApiConfig, load_api_config
@@ -141,21 +141,43 @@ def parse_args() -> argparse.Namespace:
         help="Max items loaded per platform; 0 means load all",
     )
     parser.add_argument(
-        "--hash-embedding-dim",
+        "--embedding-model",
+        type=str,
+        default="BAAI/bge-base-en-v1.5",
+        help="HuggingFace SentenceTransformer model name for dense embeddings",
+    )
+    parser.add_argument(
+        "--embedding-local-only",
+        action="store_true",
+        help="Only load embedding model from local files (no network)",
+    )
+    parser.add_argument(
+        "--embedding-device",
+        type=str,
+        default="cpu",
+        help="Device for embedding model: cpu or cuda",
+    )
+    parser.add_argument(
+        "--embedding-batch-size",
         type=int,
-        default=512,
-        help="Dimension for hash-based embedding retrieval",
+        default=64,
+        help="Batch size for embedding encoding",
+    )
+    parser.add_argument(
+        "--embedding-show-progress",
+        action="store_true",
+        help="Show embedding encode progress bar",
     )
     parser.add_argument(
         "--hybrid-alpha",
         type=float,
-        default=0.45,
+        default=0.25,
         help="Hybrid score weight for BM25 vs vector (alpha*bm25 + (1-alpha)*vector)",
     )
     parser.add_argument(
         "--hybrid-topk",
         type=int,
-        default=200,
+        default=800,
         help="BM25 candidate pool size for hybrid retrieval (topK by BM25)",
     )
     parser.add_argument(
@@ -223,6 +245,7 @@ def hash_embedding(text: str, dim: int) -> List[float]:
 
 
 def cosine(a: Sequence[float], b: Sequence[float]) -> float:
+    # Deprecated: kept for backward compatibility with earlier experiments.
     return sum(x * y for x, y in zip(a, b))
 
 
@@ -394,13 +417,14 @@ def build_bm25_index(
 def load_platform_items(
     platform_file: Path,
     max_items: int,
-    emb_dim: int,
     bm25_k1: float,
     bm25_b: float,
-) -> Tuple[List[Item], Dict[str, Item], List[List[float]], BM25Index]:
+    embedder,
+    embedding_batch_size: int,
+    embedding_show_progress: bool,
+) -> Tuple[List[Item], Dict[str, Item], "np.ndarray", BM25Index]:
     items: List[Item] = []
     asin_map: Dict[str, Item] = {}
-    vectors: List[List[float]] = []
     doc_texts: List[str] = []
 
     with platform_file.open("r", encoding="utf-8") as f:
@@ -412,13 +436,27 @@ def load_platform_items(
             if not item.parent_asin:
                 continue
             text = item_retrieval_text(item)
-            vec = hash_embedding(text, emb_dim)
             items.append(item)
             asin_map[item.parent_asin] = item
-            vectors.append(vec)
             doc_texts.append(text)
 
     bm25 = build_bm25_index(doc_texts, k1=bm25_k1, b=bm25_b)
+    # Dense embeddings (normalized) for cosine via dot product.
+    import numpy as np
+
+    if not doc_texts:
+        vectors = np.zeros((0, 1), dtype=np.float32)
+    else:
+        t0 = time.time()
+        vectors = embedder.encode(
+            doc_texts,
+            batch_size=max(1, int(embedding_batch_size)),
+            normalize_embeddings=True,
+            show_progress_bar=bool(embedding_show_progress),
+        ).astype(np.float32, copy=False)
+        dt = time.time() - t0
+        if dt > 0:
+            print(f"  embedding_done docs={len(doc_texts)} dim={vectors.shape[1]} time_s={dt:.1f} docs_per_s={len(doc_texts)/dt:.1f}")
     return items, asin_map, vectors, bm25
 
 
@@ -474,11 +512,11 @@ query_text={query}
 def retrieve_top1(
     ua_structured: Dict,
     items: List[Item],
-    vectors: List[List[float]],
-    emb_dim: int,
+    vectors,
     bm25: BM25Index,
     hybrid_alpha: float,
     hybrid_topk: int,
+    embedder,
 ) -> Tuple[Item, float]:
     if not items:
         raise ValueError("Platform has no items loaded")
@@ -491,16 +529,19 @@ def retrieve_top1(
             str(ua_structured.get("user_need") or ""),
         ]
     )
-    qvec = hash_embedding(qtext, emb_dim)
+    import numpy as np
+
+    qvec = embedder.encode([qtext], normalize_embeddings=True, show_progress_bar=False)
+    qvec = np.asarray(qvec, dtype=np.float32).reshape(-1)
 
     # Stage 1: BM25 candidate pool (no full-scan)
     candidates = bm25.topk(qtext, k=max(1, hybrid_topk))
     if not candidates:
-        # Fallback to full scan on hash vectors only if BM25 can't score anything.
+        # Fallback to full scan on dense vectors only if BM25 can't score anything.
         best_idx = 0
         best_score = -1e9
-        for idx, ivec in enumerate(vectors):
-            s = cosine(qvec, ivec)
+        for idx in range(int(getattr(vectors, "shape", [len(items)])[0])):
+            s = float(vectors[idx].dot(qvec))
             if s > best_score:
                 best_score = s
                 best_idx = idx
@@ -515,7 +556,7 @@ def retrieve_top1(
 
     vec_raw: Dict[int, float] = {}
     for doc_id, _ in candidates:
-        vec_raw[doc_id] = cosine(qvec, vectors[doc_id])
+        vec_raw[doc_id] = float(vectors[doc_id].dot(qvec))
     vmin, vmax = min(vec_raw.values()), max(vec_raw.values())
     if vmax > vmin:
         vec_norm = {doc_id: (s - vmin) / (vmax - vmin) for doc_id, s in vec_raw.items()}
@@ -734,6 +775,8 @@ def run_simulation(args: argparse.Namespace) -> None:
         raise ValueError("--bm25-k1 must be > 0")
     if not (0.0 <= args.bm25_b <= 1.0):
         raise ValueError("--bm25-b must be in [0, 1]")
+    if args.embedding_batch_size <= 0:
+        raise ValueError("--embedding-batch-size must be > 0")
 
     random.seed(args.seed)
 
@@ -753,16 +796,41 @@ def run_simulation(args: argparse.Namespace) -> None:
     client = OpenAI(base_url=api.base_url, api_key=api.api_key, timeout=api.timeout_seconds)
     chat_model = api.default_model
 
+    print(f"Loading embedding model: {args.embedding_model} (device={args.embedding_device})")
+    try:
+        from sentence_transformers import SentenceTransformer  # type: ignore
+    except Exception as err:
+        raise RuntimeError(
+            "Missing dependency: sentence-transformers. Install with `pip install -U sentence-transformers`."
+        ) from err
+    try:
+        embedder = SentenceTransformer(
+            args.embedding_model,
+            device=args.embedding_device,
+            local_files_only=bool(args.embedding_local_only),
+        )
+    except TypeError:
+        # Older sentence-transformers versions may not support local_files_only.
+        if args.embedding_local_only:
+            raise RuntimeError(
+                "Your sentence-transformers version doesn't support local_files_only. "
+                "Please upgrade with `pip install -U sentence-transformers`."
+            )
+        embedder = SentenceTransformer(args.embedding_model, device=args.embedding_device)
+
     print("Loading platform catalogs and building retrieval vectors...")
     platform_data = {}
     for idx, pfile in enumerate(platform_files):
         pid = platform_ids[idx]
+        print(f"{pid}: reading_items+bm25+embedding from {pfile} ...")
         items, asin_map, vectors, bm25 = load_platform_items(
             platform_file=pfile,
             max_items=args.max_platform_items,
-            emb_dim=args.hash_embedding_dim,
             bm25_k1=args.bm25_k1,
             bm25_b=args.bm25_b,
+            embedder=embedder,
+            embedding_batch_size=args.embedding_batch_size,
+            embedding_show_progress=args.embedding_show_progress,
         )
         if not items:
             raise RuntimeError(f"{pid} has no loaded items: {pfile}")
@@ -880,7 +948,7 @@ def run_simulation(args: argparse.Namespace) -> None:
                     pdata = platform_data[pid]
                     asin_map: Dict[str, Item] = pdata["asin_map"]
                     items: List[Item] = pdata["items"]
-                    vectors: List[List[float]] = pdata["vectors"]
+                    vectors = pdata["vectors"]
                     bm25: BM25Index = pdata["bm25"]
 
                     forced_hit = False
@@ -893,10 +961,10 @@ def run_simulation(args: argparse.Namespace) -> None:
                             ua_structured=ua_struct,
                             items=items,
                             vectors=vectors,
-                            emb_dim=args.hash_embedding_dim,
                             bm25=bm25,
                             hybrid_alpha=args.hybrid_alpha,
                             hybrid_topk=args.hybrid_topk,
+                            embedder=embedder,
                         )
 
                     style = choose_pitch_style(pid)
@@ -1094,6 +1162,9 @@ def run_simulation(args: argparse.Namespace) -> None:
         "hybrid_topk": args.hybrid_topk,
         "bm25_k1": args.bm25_k1,
         "bm25_b": args.bm25_b,
+        "embedding_model": args.embedding_model,
+        "embedding_device": args.embedding_device,
+        "embedding_batch_size": args.embedding_batch_size,
         "seed": args.seed,
     }
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
