@@ -2,6 +2,7 @@
 import argparse
 import hashlib
 import json
+import sys
 import time
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -193,6 +194,12 @@ def generate_queries(args: argparse.Namespace) -> None:
     skipped = 0
     errors = 0
 
+    # Best-effort total for progress display (counts raw lines, not necessarily valid users).
+    with args.user_history_path.open("r", encoding="utf-8") as f:
+        total_lines = sum(1 for _ in f)
+    remaining_lines = max(0, total_lines - args.start_line + 1)
+    total_target = remaining_lines if args.max_users == 0 else min(remaining_lines, args.max_users)
+
     with args.user_history_path.open("r", encoding="utf-8") as src, args.output_path.open(
         "w", encoding="utf-8"
     ) as dst:
@@ -220,7 +227,6 @@ def generate_queries(args: argparse.Namespace) -> None:
 
             style = choose_style(user_id)
             prompt = build_prompt(style=style, user_id=user_id, history=history, target=target)
-            print(prompt)
             try:
                 query = call_model(
                     client=client,
@@ -267,12 +273,16 @@ def generate_queries(args: argparse.Namespace) -> None:
             dst.write(json.dumps(query_record, ensure_ascii=False) + "\n")
             processed += 1
 
-            if processed % 50 == 0:
-                print(f"processed={processed} skipped={skipped} errors={errors}")
+            # Single-line progress indicator.
+            sys.stderr.write(
+                f"\r[generate_user_queries] {processed}/{total_target} processed | skipped={skipped} errors={errors}"
+            )
+            sys.stderr.flush()
 
             if args.sleep_seconds > 0:
                 time.sleep(args.sleep_seconds)
 
+    sys.stderr.write("\n")
     print(
         json.dumps(
             {

@@ -5,9 +5,11 @@ import json
 import math
 import random
 import re
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from heapq import nlargest
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from openai import OpenAI
@@ -53,6 +55,37 @@ class PlatformCandidate:
     forced_intended_hit: bool
 
 
+@dataclass
+class BM25Index:
+    postings: Dict[str, List[Tuple[int, int]]]  # token -> [(doc_id, tf)]
+    doc_len: List[int]
+    idf: Dict[str, float]
+    avgdl: float
+    k1: float
+    b: float
+
+    def topk(self, query: str, k: int) -> List[Tuple[int, float]]:
+        q_tokens = tokenize(query)
+        if not q_tokens:
+            return []
+
+        scores: Dict[int, float] = {}
+        for tok in q_tokens:
+            plist = self.postings.get(tok)
+            if not plist:
+                continue
+            idf = self.idf.get(tok, 0.0)
+            for doc_id, tf in plist:
+                dl = self.doc_len[doc_id]
+                denom = tf + self.k1 * (1.0 - self.b + self.b * (dl / self.avgdl))
+                s = idf * (tf * (self.k1 + 1.0)) / (denom if denom else 1.0)
+                scores[doc_id] = scores.get(doc_id, 0.0) + s
+
+        if not scores:
+            return []
+        return nlargest(k, scores.items(), key=lambda x: x[1])
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run UA-PA simulation: structured query, platform recall, UA ranking, settlement."
@@ -90,7 +123,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--intended-hit-prob",
         type=float,
-        default=1,
+        default=0.9,
         help="If intended item exists in platform catalog, chance to force-hit it",
     )
     parser.add_argument(
@@ -110,6 +143,30 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=512,
         help="Dimension for hash-based embedding retrieval",
+    )
+    parser.add_argument(
+        "--hybrid-alpha",
+        type=float,
+        default=0.45,
+        help="Hybrid score weight for BM25 vs vector (alpha*bm25 + (1-alpha)*vector)",
+    )
+    parser.add_argument(
+        "--hybrid-topk",
+        type=int,
+        default=200,
+        help="BM25 candidate pool size for hybrid retrieval (topK by BM25)",
+    )
+    parser.add_argument(
+        "--bm25-k1",
+        type=float,
+        default=1.2,
+        help="BM25 k1 parameter",
+    )
+    parser.add_argument(
+        "--bm25-b",
+        type=float,
+        default=0.75,
+        help="BM25 b parameter",
     )
     parser.add_argument(
         "--max-retries",
@@ -285,10 +342,57 @@ def item_retrieval_text(item: Item) -> str:
     return clean_text(" ".join(p for p in parts if p), 2200)
 
 
-def load_platform_items(platform_file: Path, max_items: int, emb_dim: int) -> Tuple[List[Item], Dict[str, Item], List[List[float]]]:
+def build_bm25_index(
+    docs: List[str],
+    k1: float,
+    b: float,
+) -> BM25Index:
+    postings: Dict[str, List[Tuple[int, int]]] = {}
+    df: Dict[str, int] = {}
+    doc_len: List[int] = []
+
+    for doc_id, text in enumerate(docs):
+        toks = tokenize(text)
+        doc_len.append(len(toks))
+        if not toks:
+            continue
+        tf_map: Dict[str, int] = {}
+        for t in toks:
+            tf_map[t] = tf_map.get(t, 0) + 1
+        for t, tf in tf_map.items():
+            postings.setdefault(t, []).append((doc_id, tf))
+        for t in tf_map.keys():
+            df[t] = df.get(t, 0) + 1
+
+    n_docs = max(1, len(docs))
+    avgdl = sum(doc_len) / n_docs if doc_len else 1.0
+
+    idf: Dict[str, float] = {}
+    for t, dft in df.items():
+        # BM25+ style IDF, stable for rare/very common terms
+        idf[t] = math.log(1.0 + (n_docs - dft + 0.5) / (dft + 0.5))
+
+    return BM25Index(
+        postings=postings,
+        doc_len=doc_len if doc_len else [1] * n_docs,
+        idf=idf,
+        avgdl=avgdl if avgdl > 0 else 1.0,
+        k1=k1,
+        b=b,
+    )
+
+
+def load_platform_items(
+    platform_file: Path,
+    max_items: int,
+    emb_dim: int,
+    bm25_k1: float,
+    bm25_b: float,
+) -> Tuple[List[Item], Dict[str, Item], List[List[float]], BM25Index]:
     items: List[Item] = []
     asin_map: Dict[str, Item] = {}
     vectors: List[List[float]] = []
+    doc_texts: List[str] = []
 
     with platform_file.open("r", encoding="utf-8") as f:
         for i, line in enumerate(f, start=1):
@@ -303,8 +407,10 @@ def load_platform_items(platform_file: Path, max_items: int, emb_dim: int) -> Tu
             items.append(item)
             asin_map[item.parent_asin] = item
             vectors.append(vec)
+            doc_texts.append(text)
 
-    return items, asin_map, vectors
+    bm25 = build_bm25_index(doc_texts, k1=bm25_k1, b=bm25_b)
+    return items, asin_map, vectors, bm25
 
 
 def ua_structure_query(
@@ -361,6 +467,9 @@ def retrieve_top1(
     items: List[Item],
     vectors: List[List[float]],
     emb_dim: int,
+    bm25: BM25Index,
+    hybrid_alpha: float,
+    hybrid_topk: int,
 ) -> Tuple[Item, float]:
     if not items:
         raise ValueError("Platform has no items loaded")
@@ -375,13 +484,48 @@ def retrieve_top1(
     )
     qvec = hash_embedding(qtext, emb_dim)
 
-    best_idx = 0
+    # Stage 1: BM25 candidate pool (no full-scan)
+    candidates = bm25.topk(qtext, k=max(1, hybrid_topk))
+    if not candidates:
+        # Fallback to full scan on hash vectors only if BM25 can't score anything.
+        best_idx = 0
+        best_score = -1e9
+        for idx, ivec in enumerate(vectors):
+            s = cosine(qvec, ivec)
+            if s > best_score:
+                best_score = s
+                best_idx = idx
+        return items[best_idx], best_score
+
+    bm25_scores = [s for _, s in candidates]
+    bmin, bmax = min(bm25_scores), max(bm25_scores)
+    if bmax > bmin:
+        bm25_norm = {doc_id: (s - bmin) / (bmax - bmin) for doc_id, s in candidates}
+    else:
+        bm25_norm = {doc_id: 0.0 for doc_id, _ in candidates}
+
+    vec_raw: Dict[int, float] = {}
+    for doc_id, _ in candidates:
+        vec_raw[doc_id] = cosine(qvec, vectors[doc_id])
+    vmin, vmax = min(vec_raw.values()), max(vec_raw.values())
+    if vmax > vmin:
+        vec_norm = {doc_id: (s - vmin) / (vmax - vmin) for doc_id, s in vec_raw.items()}
+    else:
+        vec_norm = {doc_id: 0.0 for doc_id, _ in candidates}
+
+    alpha = float(hybrid_alpha)
+    if alpha < 0.0:
+        alpha = 0.0
+    if alpha > 1.0:
+        alpha = 1.0
+
+    best_idx = candidates[0][0]
     best_score = -1e9
-    for idx, ivec in enumerate(vectors):
-        s = cosine(qvec, ivec)
+    for doc_id, _ in candidates:
+        s = alpha * bm25_norm.get(doc_id, 0.0) + (1.0 - alpha) * vec_norm.get(doc_id, 0.0)
         if s > best_score:
             best_score = s
-            best_idx = idx
+            best_idx = doc_id
     return items[best_idx], best_score
 
 
@@ -575,6 +719,12 @@ def run_simulation(args: argparse.Namespace) -> None:
         raise ValueError("--intended-hit-prob must be in [0, 1]")
     if args.profile_window_size <= 0:
         raise ValueError("--profile-window-size must be > 0")
+    if args.hybrid_topk <= 0:
+        raise ValueError("--hybrid-topk must be > 0")
+    if args.bm25_k1 <= 0:
+        raise ValueError("--bm25-k1 must be > 0")
+    if not (0.0 <= args.bm25_b <= 1.0):
+        raise ValueError("--bm25-b must be in [0, 1]")
 
     random.seed(args.seed)
 
@@ -598,10 +748,12 @@ def run_simulation(args: argparse.Namespace) -> None:
     platform_data = {}
     for idx, pfile in enumerate(platform_files):
         pid = platform_ids[idx]
-        items, asin_map, vectors = load_platform_items(
+        items, asin_map, vectors, bm25 = load_platform_items(
             platform_file=pfile,
             max_items=args.max_platform_items,
             emb_dim=args.hash_embedding_dim,
+            bm25_k1=args.bm25_k1,
+            bm25_b=args.bm25_b,
         )
         if not items:
             raise RuntimeError(f"{pid} has no loaded items: {pfile}")
@@ -609,6 +761,7 @@ def run_simulation(args: argparse.Namespace) -> None:
             "items": items,
             "asin_map": asin_map,
             "vectors": vectors,
+            "bm25": bm25,
         }
         print(f"{pid}: loaded_items={len(items)}")
 
@@ -618,7 +771,14 @@ def run_simulation(args: argparse.Namespace) -> None:
 
     processed = 0
     skipped_no_intended = 0
+    skipped_intended_not_hit = 0
     error_rounds = 0
+
+    # Best-effort total for progress display (counts raw lines, not necessarily status=ok).
+    with args.user_queries_path.open("r", encoding="utf-8") as f:
+        total_lines = sum(1 for _ in f)
+    remaining_lines = max(0, total_lines - args.start_line + 1)
+    total_target = remaining_lines if args.max_queries == 0 else min(remaining_lines, args.max_queries)
 
     with args.user_queries_path.open("r", encoding="utf-8") as src, rounds_path.open(
         "w", encoding="utf-8"
@@ -655,14 +815,67 @@ def run_simulation(args: argparse.Namespace) -> None:
                 )
 
                 candidates: List[PlatformCandidate] = []
+                # Pre-decide which platforms (if any) will "hit" the intended item.
+                intended_hit_pids: List[str] = []
+                intended_exists_any = False
+                for pid in platform_ids:
+                    asin_map: Dict[str, Item] = platform_data[pid]["asin_map"]
+                    if target_asin in asin_map:
+                        intended_exists_any = True
+                        if random.random() < args.intended_hit_prob:
+                            intended_hit_pids.append(pid)
+
+                # If intended item doesn't exist in any platform catalog, skip the whole round.
+                if not intended_exists_any:
+                    skipped_no_intended += 1
+                    round_obj.update(
+                        {
+                            "status": "skipped_no_intended",
+                            "ua_structured_query": ua_struct,
+                            "intended_hit_platform_ids": [],
+                        }
+                    )
+                    persist_platform_profiles(profiles_path, platform_profiles)
+                    dst.write(json.dumps(round_obj, ensure_ascii=False) + "\n")
+                    processed += 1
+                    sys.stderr.write(
+                        f"\r[run_ua_pa_simulation] {processed}/{total_target} simulated | skipped_no_intended={skipped_no_intended} skipped_intended_not_hit={skipped_intended_not_hit} error_rounds={error_rounds}"
+                    )
+                    sys.stderr.flush()
+                    if args.sleep_seconds > 0:
+                        time.sleep(args.sleep_seconds)
+                    continue
+
+                # If no platform hits the intended item, skip the expensive PA top1 retrieval + pitch.
+                if not intended_hit_pids:
+                    skipped_intended_not_hit += 1
+                    round_obj.update(
+                        {
+                            "status": "skipped_intended_not_hit",
+                            "ua_structured_query": ua_struct,
+                            "intended_hit_platform_ids": [],
+                        }
+                    )
+                    persist_platform_profiles(profiles_path, platform_profiles)
+                    dst.write(json.dumps(round_obj, ensure_ascii=False) + "\n")
+                    processed += 1
+                    sys.stderr.write(
+                        f"\r[run_ua_pa_simulation] {processed}/{total_target} simulated | skipped_no_intended={skipped_no_intended} skipped_intended_not_hit={skipped_intended_not_hit} error_rounds={error_rounds}"
+                    )
+                    sys.stderr.flush()
+                    if args.sleep_seconds > 0:
+                        time.sleep(args.sleep_seconds)
+                    continue
+
                 for pid in platform_ids:
                     pdata = platform_data[pid]
                     asin_map: Dict[str, Item] = pdata["asin_map"]
                     items: List[Item] = pdata["items"]
                     vectors: List[List[float]] = pdata["vectors"]
+                    bm25: BM25Index = pdata["bm25"]
 
                     forced_hit = False
-                    if target_asin in asin_map and random.random() < args.intended_hit_prob:
+                    if pid in intended_hit_pids:
                         chosen = asin_map[target_asin]
                         score = 1.0
                         forced_hit = True
@@ -672,6 +885,9 @@ def run_simulation(args: argparse.Namespace) -> None:
                             items=items,
                             vectors=vectors,
                             emb_dim=args.hash_embedding_dim,
+                            bm25=bm25,
+                            hybrid_alpha=args.hybrid_alpha,
+                            hybrid_topk=args.hybrid_topk,
                         )
 
                     style = choose_pitch_style(f"{query_id}|{pid}")
@@ -721,6 +937,10 @@ def run_simulation(args: argparse.Namespace) -> None:
                     persist_platform_profiles(profiles_path, platform_profiles)
                     dst.write(json.dumps(round_obj, ensure_ascii=False) + "\n")
                     processed += 1
+                    sys.stderr.write(
+                        f"\r[run_ua_pa_simulation] {processed}/{total_target} simulated | skipped_no_intended={skipped_no_intended} skipped_intended_not_hit={skipped_intended_not_hit} error_rounds={error_rounds}"
+                    )
+                    sys.stderr.flush()
                     if args.sleep_seconds > 0:
                         time.sleep(args.sleep_seconds)
                     continue
@@ -828,10 +1048,10 @@ def run_simulation(args: argparse.Namespace) -> None:
                 dst.write(json.dumps(round_obj, ensure_ascii=False) + "\n")
                 processed += 1
 
-                if processed % 10 == 0:
-                    print(
-                        f"processed={processed} skipped_no_intended={skipped_no_intended} error_rounds={error_rounds}"
-                    )
+                sys.stderr.write(
+                    f"\r[run_ua_pa_simulation] {processed}/{total_target} simulated | skipped_no_intended={skipped_no_intended} skipped_intended_not_hit={skipped_intended_not_hit} error_rounds={error_rounds}"
+                )
+                sys.stderr.flush()
 
                 if args.sleep_seconds > 0:
                     time.sleep(args.sleep_seconds)
@@ -842,7 +1062,12 @@ def run_simulation(args: argparse.Namespace) -> None:
                 dst.write(json.dumps(round_obj, ensure_ascii=False) + "\n")
                 processed += 1
                 persist_platform_profiles(profiles_path, platform_profiles)
+                sys.stderr.write(
+                    f"\r[run_ua_pa_simulation] {processed}/{total_target} simulated | skipped_no_intended={skipped_no_intended} skipped_intended_not_hit={skipped_intended_not_hit} error_rounds={error_rounds}"
+                )
+                sys.stderr.flush()
 
+    sys.stderr.write("\n")
     summary = {
         "user_queries_path": str(args.user_queries_path),
         "platform_dir": str(args.platform_dir),
@@ -850,11 +1075,16 @@ def run_simulation(args: argparse.Namespace) -> None:
         "profiles_path": str(profiles_path),
         "processed_rounds": processed,
         "skipped_no_intended": skipped_no_intended,
+        "skipped_intended_not_hit": skipped_intended_not_hit,
         "error_rounds": error_rounds,
         "chat_model": chat_model,
         "intended_hit_prob": args.intended_hit_prob,
         "profile_window_size": args.profile_window_size,
         "max_platform_items": args.max_platform_items,
+        "hybrid_alpha": args.hybrid_alpha,
+        "hybrid_topk": args.hybrid_topk,
+        "bm25_k1": args.bm25_k1,
+        "bm25_b": args.bm25_b,
         "seed": args.seed,
     }
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
