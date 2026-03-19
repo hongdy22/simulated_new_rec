@@ -1,0 +1,13 @@
+{
+  "api": {
+    "base_url": "http://115.182.62.174:18888/v1",
+    "api_key": "PUT_YOUR_API_KEY_HERE",
+    "default_model": "z-ai/glm-4.5",
+    "timeout_seconds": 120,
+    "endpoints": {
+      "models": "/models",
+      "chat_completions": "/chat/completions"
+    }
+  }
+}
+

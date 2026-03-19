@@ -1,0 +1,7 @@
+config.json
+.venv/
+output/
+__pycache__/
+.vscode/
+.DS_Store
+tools/
