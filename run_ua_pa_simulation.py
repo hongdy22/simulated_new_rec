@@ -18,8 +18,10 @@ from config_loader import ApiConfig, load_api_config
 
 PITCH_STYLE_GUIDES = {
     "honest": "Use a transparent, factual tone. Mention trade-offs when relevant and avoid hype.",
-    "exaggerated": "Use a promotional, high-energy tone while staying plausible and not inventing specs.",
-    "unconstrained": "No extra style constraints. Write naturally in your own preferred persuasive style.",
+    "expert": "Use a calm, expert tone. Highlight the most decision-critical specs and who it's for.",
+    "concise": "Be extremely concise: one sentence, no fluff, focus on the single strongest reason.",
+    "friendly": "Use a warm, friendly tone. Make it easy to understand and avoid jargon.",
+    "promo": "Use a promotional, high-energy tone while staying plausible and not inventing specs.",
 }
 
 
@@ -298,11 +300,18 @@ def parse_rank_list(text: str, valid_ids: List[str]) -> Optional[List[str]]:
     return None
 
 
-def choose_pitch_style(seed_text: str) -> str:
-    styles = sorted(PITCH_STYLE_GUIDES.keys())
-    digest = hashlib.md5(seed_text.encode("utf-8")).hexdigest()
-    idx = int(digest[:8], 16) % len(styles)
-    return styles[idx]
+def choose_pitch_style(platform_id: str) -> str:
+    platform_style_map = {
+        "P1": "honest",
+        "P2": "expert",
+        "P3": "concise",
+        "P4": "friendly",
+        "P5": "promo",
+    }
+    style = platform_style_map.get(platform_id)
+    if style in PITCH_STYLE_GUIDES:
+        return style
+    return "honest"
 
 
 def build_item_from_obj(obj: Dict) -> Item:
@@ -890,7 +899,7 @@ def run_simulation(args: argparse.Namespace) -> None:
                             hybrid_topk=args.hybrid_topk,
                         )
 
-                    style = choose_pitch_style(f"{query_id}|{pid}")
+                    style = choose_pitch_style(pid)
                     pitch = generate_platform_pitch(
                         client=client,
                         model=chat_model,
