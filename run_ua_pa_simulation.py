@@ -6,13 +6,17 @@ import math
 import random
 import re
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 from openai import OpenAI
 from config_loader import ApiConfig, load_api_config
+
+_THREAD_LOCAL = threading.local()
 
 
 PITCH_STYLE_GUIDES = {
@@ -160,6 +164,12 @@ def parse_args() -> argparse.Namespace:
         default=42,
         help="Random seed",
     )
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=10,
+        help="Number of queries to simulate concurrently",
+    )
     return parser.parse_args()
 
 
@@ -226,6 +236,14 @@ def llm_chat_json(
             if attempt < max_retries:
                 time.sleep(min(2.0 * attempt, 8.0))
     raise RuntimeError(f"LLM request failed after retries: {last_err}")
+
+
+def get_thread_client(api: ApiConfig) -> OpenAI:
+    client = getattr(_THREAD_LOCAL, "openai_client", None)
+    if client is None:
+        client = OpenAI(base_url=api.base_url, api_key=api.api_key, timeout=api.timeout_seconds)
+        _THREAD_LOCAL.openai_client = client
+    return client
 
 
 def parse_json_object(text: str) -> Optional[Dict]:
@@ -424,16 +442,8 @@ query_text={query}
     }
 
 
-def retrieve_top1(
-    ua_structured: Dict,
-    items: List[Item],
-    vectors,
-    embedder,
-) -> Tuple[Item, float]:
-    if not items:
-        raise ValueError("Platform has no items loaded")
-
-    qtext = " ".join(
+def build_retrieval_query_text(ua_structured: Dict) -> str:
+    return " ".join(
         [
             str(ua_structured.get("query_rewrite") or ""),
             " ".join(str(x) for x in (ua_structured.get("keywords") or [])),
@@ -441,14 +451,19 @@ def retrieve_top1(
             str(ua_structured.get("user_need") or ""),
         ]
     )
-    import numpy as np
 
-    qvec = embedder.encode([qtext], normalize_embeddings=True, show_progress_bar=False)
-    qvec = np.asarray(qvec, dtype=np.float32).reshape(-1)
+
+def retrieve_top1_with_query_vector(
+    items: List[Item],
+    vectors,
+    query_vector,
+) -> Tuple[Item, float]:
+    if not items:
+        raise ValueError("Platform has no items loaded")
     if vectors is None or getattr(vectors, "shape", (0,))[0] == 0:
         raise ValueError("Platform has no embedding vectors loaded")
 
-    scores = vectors @ qvec
+    scores = vectors @ query_vector
     best_idx = int(scores.argmax())
     best_score = float(scores[best_idx])
     return items[best_idx], best_score
@@ -509,9 +524,13 @@ def ua_rank_candidates(
     user_query: str,
     candidates: List[PlatformCandidate],
     platform_profiles: Dict[str, List[str]],
+    rng: Optional[random.Random] = None,
 ) -> Tuple[List[str], str]:
     shuffled = candidates[:]
-    random.shuffle(shuffled)
+    if rng is None:
+        random.shuffle(shuffled)
+    else:
+        rng.shuffle(shuffled)
 
     blocks: List[str] = []
     valid_ids = [c.platform_id for c in shuffled]
@@ -635,6 +654,229 @@ def persist_platform_profiles(path: Path, profiles: Dict[str, List[str]]) -> Non
     path.write_text(json.dumps(profiles, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def simulate_single_round(
+    api: ApiConfig,
+    chat_model: str,
+    max_retries: int,
+    intended_hit_prob: float,
+    seed: int,
+    line_no: int,
+    qrec: Dict,
+    platform_ids: List[str],
+    platform_data: Dict,
+    platform_profiles_snapshot: Dict[str, List[str]],
+    embedder,
+) -> Dict:
+    user_query = str(qrec.get("query_text") or "")
+    target_item = qrec.get("target_item") or {}
+    target_asin = str(target_item.get("parent_asin") or "")
+    query_id = str(qrec.get("query_id") or f"line_{line_no}")
+    round_obj = {
+        "query_id": query_id,
+        "source_line": line_no,
+        "user_id": qrec.get("user_id"),
+        "target_asin": target_asin,
+        "status": "started",
+    }
+
+    memory_updates: List[Tuple[str, str]] = []
+    rng = random.Random(f"{seed}|{query_id}|{line_no}")
+    client = get_thread_client(api)
+
+    try:
+        ua_struct = ua_structure_query(
+            client=client,
+            model=chat_model,
+            max_retries=max_retries,
+            query_record=qrec,
+        )
+
+        candidates: List[PlatformCandidate] = []
+        intended_hit_pids: List[str] = []
+        intended_exists_any = False
+        for pid in platform_ids:
+            asin_map: Dict[str, Item] = platform_data[pid]["asin_map"]
+            if target_asin in asin_map:
+                intended_exists_any = True
+                if rng.random() < intended_hit_prob:
+                    intended_hit_pids.append(pid)
+
+        if not intended_exists_any:
+            round_obj.update(
+                {
+                    "status": "skipped_no_intended",
+                    "ua_structured_query": ua_struct,
+                    "intended_hit_platform_ids": [],
+                }
+            )
+            return {"source_line": line_no, "round_obj": round_obj, "memory_updates": memory_updates}
+
+        if not intended_hit_pids:
+            round_obj.update(
+                {
+                    "status": "skipped_intended_not_hit",
+                    "ua_structured_query": ua_struct,
+                    "intended_hit_platform_ids": [],
+                }
+            )
+            return {"source_line": line_no, "round_obj": round_obj, "memory_updates": memory_updates}
+
+        import numpy as np
+
+        query_text = build_retrieval_query_text(ua_struct)
+        query_vector = embedder.encode([query_text], normalize_embeddings=True, show_progress_bar=False)
+        query_vector = np.asarray(query_vector, dtype=np.float32).reshape(-1)
+
+        for pid in platform_ids:
+            pdata = platform_data[pid]
+            asin_map: Dict[str, Item] = pdata["asin_map"]
+            items: List[Item] = pdata["items"]
+            vectors = pdata["vectors"]
+
+            forced_hit = False
+            if pid in intended_hit_pids:
+                chosen = asin_map[target_asin]
+                score = 1.0
+                forced_hit = True
+            else:
+                chosen, score = retrieve_top1_with_query_vector(
+                    items=items,
+                    vectors=vectors,
+                    query_vector=query_vector,
+                )
+
+            style = choose_pitch_style(pid)
+            pitch = generate_platform_pitch(
+                client=client,
+                model=chat_model,
+                max_retries=max_retries,
+                platform_id=pid,
+                ua_structured=ua_struct,
+                item=chosen,
+                pitch_style=style,
+            )
+
+            candidates.append(
+                PlatformCandidate(
+                    platform_id=pid,
+                    item=chosen,
+                    pitch=pitch,
+                    pitch_style=style,
+                    retrieval_score=score,
+                    forced_intended_hit=forced_hit,
+                )
+            )
+
+        intended_platforms = [c.platform_id for c in candidates if c.item.parent_asin == target_asin]
+        if not intended_platforms:
+            round_obj.update(
+                {
+                    "status": "skipped_no_intended",
+                    "ua_structured_query": ua_struct,
+                    "platform_candidates": [
+                        {
+                            "platform_id": c.platform_id,
+                            "item": c.item.to_pitch_payload(),
+                            "pitch": c.pitch,
+                            "pitch_style": c.pitch_style,
+                            "retrieval_score": c.retrieval_score,
+                            "forced_intended_hit": c.forced_intended_hit,
+                        }
+                        for c in candidates
+                    ],
+                }
+            )
+            return {"source_line": line_no, "round_obj": round_obj, "memory_updates": memory_updates}
+
+        rank_list, rationale = ua_rank_candidates(
+            client=client,
+            model=chat_model,
+            max_retries=max_retries,
+            user_query=user_query,
+            candidates=candidates,
+            platform_profiles=platform_profiles_snapshot,
+            rng=rng,
+        )
+
+        first_target_rank = None
+        for idx, pid in enumerate(rank_list, start=1):
+            c = next(x for x in candidates if x.platform_id == pid)
+            if c.item.parent_asin == target_asin:
+                first_target_rank = idx
+                break
+
+        if first_target_rank is None:
+            round_obj.update(
+                {
+                    "status": "skipped_after_ranking_no_intended",
+                    "ua_structured_query": ua_struct,
+                    "ua_rank_list": rank_list,
+                    "ua_rationale": rationale,
+                }
+            )
+            return {"source_line": line_no, "round_obj": round_obj, "memory_updates": memory_updates}
+
+        reward_pid = rank_list[first_target_rank - 1]
+        penalty_pids = rank_list[: first_target_rank - 1]
+
+        for pos, pid in enumerate(rank_list, start=1):
+            cand = next(x for x in candidates if x.platform_id == pid)
+            if pid in penalty_pids:
+                mem = generate_reputation_memory(
+                    client=client,
+                    model=chat_model,
+                    max_retries=max_retries,
+                    event_type="penalty",
+                    platform_id=pid,
+                    user_query=user_query,
+                    item_title=cand.item.title,
+                    rank_pos=pos,
+                    target_rank=first_target_rank,
+                )
+                memory_updates.append((pid, mem))
+            elif pid == reward_pid:
+                mem = generate_reputation_memory(
+                    client=client,
+                    model=chat_model,
+                    max_retries=max_retries,
+                    event_type="reward",
+                    platform_id=pid,
+                    user_query=user_query,
+                    item_title=cand.item.title,
+                    rank_pos=pos,
+                    target_rank=first_target_rank,
+                )
+                memory_updates.append((pid, mem))
+
+        round_obj.update(
+            {
+                "status": "settled",
+                "ua_structured_query": ua_struct,
+                "platform_candidates": [
+                    {
+                        "platform_id": c.platform_id,
+                        "item": c.item.to_pitch_payload(),
+                        "pitch": c.pitch,
+                        "pitch_style": c.pitch_style,
+                        "retrieval_score": c.retrieval_score,
+                        "forced_intended_hit": c.forced_intended_hit,
+                    }
+                    for c in candidates
+                ],
+                "intended_platform_ids": intended_platforms,
+                "ua_rank_list": rank_list,
+                "ua_rationale": rationale,
+                "target_rank": first_target_rank,
+                "reward_platform": reward_pid,
+                "penalty_platforms": penalty_pids,
+            }
+        )
+        return {"source_line": line_no, "round_obj": round_obj, "memory_updates": memory_updates}
+    except Exception as err:
+        round_obj.update({"status": "error", "error": str(err)})
+        return {"source_line": line_no, "round_obj": round_obj, "memory_updates": memory_updates}
+
+
 def run_simulation(args: argparse.Namespace) -> None:
     if args.start_line <= 0:
         raise ValueError("--start-line must be >= 1")
@@ -646,6 +888,8 @@ def run_simulation(args: argparse.Namespace) -> None:
         raise ValueError("--profile-window-size must be > 0")
     if args.embedding_batch_size <= 0:
         raise ValueError("--embedding-batch-size must be > 0")
+    if args.concurrency <= 0:
+        raise ValueError("--concurrency must be > 0")
 
     random.seed(args.seed)
 
@@ -662,7 +906,6 @@ def run_simulation(args: argparse.Namespace) -> None:
     summary_path = output_dir / "simulation_summary.json"
 
     api = load_api_config()
-    client = OpenAI(base_url=api.base_url, api_key=api.api_key, timeout=api.timeout_seconds)
     chat_model = api.default_model
 
     print(f"Loading embedding model: {args.embedding_model} (device={args.embedding_device})")
@@ -728,268 +971,80 @@ def run_simulation(args: argparse.Namespace) -> None:
 
     with args.user_queries_path.open("r", encoding="utf-8") as src, rounds_path.open(
         "w", encoding="utf-8"
-    ) as dst:
-        for line_no, line in enumerate(src, start=1):
-            if line_no < args.start_line:
-                continue
-            if args.max_queries and processed >= args.max_queries:
-                break
+    ) as dst, ThreadPoolExecutor(max_workers=args.concurrency) as executor:
+        pending_jobs: List[Tuple[int, Dict]] = []
 
-            qrec = json.loads(line)
-            if qrec.get("status") != "ok":
-                continue
+        def flush_pending_jobs() -> None:
+            nonlocal processed, skipped_no_intended, skipped_intended_not_hit, error_rounds
+            if not pending_jobs:
+                return
 
-            user_query = str(qrec.get("query_text") or "")
-            target_item = qrec.get("target_item") or {}
-            target_asin = str(target_item.get("parent_asin") or "")
-            query_id = str(qrec.get("query_id") or f"line_{line_no}")
-
-            round_obj = {
-                "query_id": query_id,
-                "source_line": line_no,
-                "user_id": qrec.get("user_id"),
-                "target_asin": target_asin,
-                "status": "started",
+            # Snapshot profiles for this batch so each query worker sees a consistent view.
+            profiles_snapshot = {pid: vals[:] for pid, vals in platform_profiles.items()}
+            futures = {
+                executor.submit(
+                    simulate_single_round,
+                    api,
+                    chat_model,
+                    args.max_retries,
+                    args.intended_hit_prob,
+                    args.seed,
+                    line_no,
+                    qrec,
+                    platform_ids,
+                    platform_data,
+                    profiles_snapshot,
+                    embedder,
+                ): (line_no, qrec)
+                for line_no, qrec in pending_jobs
             }
 
-            try:
-                ua_struct = ua_structure_query(
-                    client=client,
-                    model=chat_model,
-                    max_retries=args.max_retries,
-                    query_record=qrec,
-                )
-
-                candidates: List[PlatformCandidate] = []
-                # Pre-decide which platforms (if any) will "hit" the intended item.
-                intended_hit_pids: List[str] = []
-                intended_exists_any = False
-                for pid in platform_ids:
-                    asin_map: Dict[str, Item] = platform_data[pid]["asin_map"]
-                    if target_asin in asin_map:
-                        intended_exists_any = True
-                        if random.random() < args.intended_hit_prob:
-                            intended_hit_pids.append(pid)
-
-                # If intended item doesn't exist in any platform catalog, skip the whole round.
-                if not intended_exists_any:
-                    skipped_no_intended += 1
-                    round_obj.update(
+            batch_results: List[Dict] = []
+            for future in as_completed(futures):
+                line_no, qrec = futures[future]
+                try:
+                    batch_results.append(future.result())
+                except Exception as err:
+                    query_id = str(qrec.get("query_id") or f"line_{line_no}")
+                    target_item = qrec.get("target_item") or {}
+                    target_asin = str(target_item.get("parent_asin") or "")
+                    batch_results.append(
                         {
-                            "status": "skipped_no_intended",
-                            "ua_structured_query": ua_struct,
-                            "intended_hit_platform_ids": [],
+                            "source_line": line_no,
+                            "round_obj": {
+                                "query_id": query_id,
+                                "source_line": line_no,
+                                "user_id": qrec.get("user_id"),
+                                "target_asin": target_asin,
+                                "status": "error",
+                                "error": f"Unexpected worker failure: {err}",
+                            },
+                            "memory_updates": [],
                         }
                     )
-                    persist_platform_profiles(profiles_path, platform_profiles)
-                    dst.write(json.dumps(round_obj, ensure_ascii=False) + "\n")
-                    processed += 1
-                    sys.stderr.write(
-                        f"\r[run_ua_pa_simulation] {processed}/{total_target} simulated | skipped_no_intended={skipped_no_intended} skipped_intended_not_hit={skipped_intended_not_hit} error_rounds={error_rounds}"
-                    )
-                    sys.stderr.flush()
-                    if args.sleep_seconds > 0:
-                        time.sleep(args.sleep_seconds)
-                    continue
 
-                # If no platform hits the intended item, skip the expensive PA top1 retrieval + pitch.
-                if not intended_hit_pids:
+            batch_results.sort(key=lambda x: int(x.get("source_line", 0)))
+            for result in batch_results:
+                round_obj = result.get("round_obj", {})
+                status = str(round_obj.get("status") or "error")
+                if status in {"skipped_no_intended", "skipped_after_ranking_no_intended"}:
+                    skipped_no_intended += 1
+                elif status == "skipped_intended_not_hit":
                     skipped_intended_not_hit += 1
-                    round_obj.update(
-                        {
-                            "status": "skipped_intended_not_hit",
-                            "ua_structured_query": ua_struct,
-                            "intended_hit_platform_ids": [],
-                        }
+                elif status == "error":
+                    error_rounds += 1
+
+                for platform_id, entry in result.get("memory_updates", []):
+                    append_profile_memory(
+                        profiles=platform_profiles,
+                        platform_id=str(platform_id),
+                        entry=str(entry),
+                        window_size=args.profile_window_size,
                     )
-                    persist_platform_profiles(profiles_path, platform_profiles)
-                    dst.write(json.dumps(round_obj, ensure_ascii=False) + "\n")
-                    processed += 1
-                    sys.stderr.write(
-                        f"\r[run_ua_pa_simulation] {processed}/{total_target} simulated | skipped_no_intended={skipped_no_intended} skipped_intended_not_hit={skipped_intended_not_hit} error_rounds={error_rounds}"
-                    )
-                    sys.stderr.flush()
-                    if args.sleep_seconds > 0:
-                        time.sleep(args.sleep_seconds)
-                    continue
-
-                for pid in platform_ids:
-                    pdata = platform_data[pid]
-                    asin_map: Dict[str, Item] = pdata["asin_map"]
-                    items: List[Item] = pdata["items"]
-                    vectors = pdata["vectors"]
-
-                    forced_hit = False
-                    if pid in intended_hit_pids:
-                        chosen = asin_map[target_asin]
-                        score = 1.0
-                        forced_hit = True
-                    else:
-                        chosen, score = retrieve_top1(
-                            ua_structured=ua_struct,
-                            items=items,
-                            vectors=vectors,
-                            embedder=embedder,
-                        )
-
-                    style = choose_pitch_style(pid)
-                    pitch = generate_platform_pitch(
-                        client=client,
-                        model=chat_model,
-                        max_retries=args.max_retries,
-                        platform_id=pid,
-                        ua_structured=ua_struct,
-                        item=chosen,
-                        pitch_style=style,
-                    )
-
-                    candidates.append(
-                        PlatformCandidate(
-                            platform_id=pid,
-                            item=chosen,
-                            pitch=pitch,
-                            pitch_style=style,
-                            retrieval_score=score,
-                            forced_intended_hit=forced_hit,
-                        )
-                    )
-
-                intended_platforms = [
-                    c.platform_id for c in candidates if c.item.parent_asin == target_asin
-                ]
-                if not intended_platforms:
-                    skipped_no_intended += 1
-                    round_obj.update(
-                        {
-                            "status": "skipped_no_intended",
-                            "ua_structured_query": ua_struct,
-                            "platform_candidates": [
-                                {
-                                    "platform_id": c.platform_id,
-                                    "item": c.item.to_pitch_payload(),
-                                    "pitch": c.pitch,
-                                    "pitch_style": c.pitch_style,
-                                    "retrieval_score": c.retrieval_score,
-                                    "forced_intended_hit": c.forced_intended_hit,
-                                }
-                                for c in candidates
-                            ],
-                        }
-                    )
-                    persist_platform_profiles(profiles_path, platform_profiles)
-                    dst.write(json.dumps(round_obj, ensure_ascii=False) + "\n")
-                    processed += 1
-                    sys.stderr.write(
-                        f"\r[run_ua_pa_simulation] {processed}/{total_target} simulated | skipped_no_intended={skipped_no_intended} skipped_intended_not_hit={skipped_intended_not_hit} error_rounds={error_rounds}"
-                    )
-                    sys.stderr.flush()
-                    if args.sleep_seconds > 0:
-                        time.sleep(args.sleep_seconds)
-                    continue
-
-                rank_list, rationale = ua_rank_candidates(
-                    client=client,
-                    model=chat_model,
-                    max_retries=args.max_retries,
-                    user_query=user_query,
-                    candidates=candidates,
-                    platform_profiles=platform_profiles,
-                )
-
-                first_target_rank = None
-                for idx, pid in enumerate(rank_list, start=1):
-                    c = next(x for x in candidates if x.platform_id == pid)
-                    if c.item.parent_asin == target_asin:
-                        first_target_rank = idx
-                        break
-
-                if first_target_rank is None:
-                    skipped_no_intended += 1
-                    round_obj.update(
-                        {
-                            "status": "skipped_after_ranking_no_intended",
-                            "ua_structured_query": ua_struct,
-                            "ua_rank_list": rank_list,
-                            "ua_rationale": rationale,
-                        }
-                    )
-                    persist_platform_profiles(profiles_path, platform_profiles)
-                    dst.write(json.dumps(round_obj, ensure_ascii=False) + "\n")
-                    processed += 1
-                    if args.sleep_seconds > 0:
-                        time.sleep(args.sleep_seconds)
-                    continue
-
-                reward_pid = rank_list[first_target_rank - 1]
-                penalty_pids = rank_list[: first_target_rank - 1]
-
-                for pos, pid in enumerate(rank_list, start=1):
-                    cand = next(x for x in candidates if x.platform_id == pid)
-                    if pid in penalty_pids:
-                        mem = generate_reputation_memory(
-                            client=client,
-                            model=chat_model,
-                            max_retries=args.max_retries,
-                            event_type="penalty",
-                            platform_id=pid,
-                            user_query=user_query,
-                            item_title=cand.item.title,
-                            rank_pos=pos,
-                            target_rank=first_target_rank,
-                        )
-                        append_profile_memory(
-                            profiles=platform_profiles,
-                            platform_id=pid,
-                            entry=mem,
-                            window_size=args.profile_window_size,
-                        )
-                    elif pid == reward_pid:
-                        mem = generate_reputation_memory(
-                            client=client,
-                            model=chat_model,
-                            max_retries=args.max_retries,
-                            event_type="reward",
-                            platform_id=pid,
-                            user_query=user_query,
-                            item_title=cand.item.title,
-                            rank_pos=pos,
-                            target_rank=first_target_rank,
-                        )
-                        append_profile_memory(
-                            profiles=platform_profiles,
-                            platform_id=pid,
-                            entry=mem,
-                            window_size=args.profile_window_size,
-                        )
-
-                round_obj.update(
-                    {
-                        "status": "settled",
-                        "ua_structured_query": ua_struct,
-                        "platform_candidates": [
-                            {
-                                "platform_id": c.platform_id,
-                                "item": c.item.to_pitch_payload(),
-                                "pitch": c.pitch,
-                                "pitch_style": c.pitch_style,
-                                "retrieval_score": c.retrieval_score,
-                                "forced_intended_hit": c.forced_intended_hit,
-                            }
-                            for c in candidates
-                        ],
-                        "intended_platform_ids": intended_platforms,
-                        "ua_rank_list": rank_list,
-                        "ua_rationale": rationale,
-                        "target_rank": first_target_rank,
-                        "reward_platform": reward_pid,
-                        "penalty_platforms": penalty_pids,
-                    }
-                )
 
                 persist_platform_profiles(profiles_path, platform_profiles)
                 dst.write(json.dumps(round_obj, ensure_ascii=False) + "\n")
                 processed += 1
-
                 sys.stderr.write(
                     f"\r[run_ua_pa_simulation] {processed}/{total_target} simulated | skipped_no_intended={skipped_no_intended} skipped_intended_not_hit={skipped_intended_not_hit} error_rounds={error_rounds}"
                 )
@@ -998,16 +1053,28 @@ def run_simulation(args: argparse.Namespace) -> None:
                 if args.sleep_seconds > 0:
                     time.sleep(args.sleep_seconds)
 
-            except Exception as err:
-                error_rounds += 1
-                round_obj.update({"status": "error", "error": str(err)})
-                dst.write(json.dumps(round_obj, ensure_ascii=False) + "\n")
-                processed += 1
-                persist_platform_profiles(profiles_path, platform_profiles)
-                sys.stderr.write(
-                    f"\r[run_ua_pa_simulation] {processed}/{total_target} simulated | skipped_no_intended={skipped_no_intended} skipped_intended_not_hit={skipped_intended_not_hit} error_rounds={error_rounds}"
-                )
-                sys.stderr.flush()
+            pending_jobs.clear()
+
+        for line_no, line in enumerate(src, start=1):
+            if line_no < args.start_line:
+                continue
+            if args.max_queries and processed >= args.max_queries:
+                break
+
+            if args.max_queries and (processed + len(pending_jobs)) >= args.max_queries:
+                flush_pending_jobs()
+                if args.max_queries and processed >= args.max_queries:
+                    break
+
+            qrec = json.loads(line)
+            if qrec.get("status") != "ok":
+                continue
+
+            pending_jobs.append((line_no, qrec))
+            if len(pending_jobs) >= args.concurrency:
+                flush_pending_jobs()
+
+        flush_pending_jobs()
 
     sys.stderr.write("\n")
     summary = {
