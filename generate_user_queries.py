@@ -16,6 +16,12 @@ STYLE_GUIDES = {
     "detailed": "Write a detailed shopping query in 1-2 sentences with concrete needs and constraints.",
     "feature_focused": "Write a query emphasizing functional features and compatibility details.",
     "scenario": "Write a query grounded in a realistic usage scenario and context.",
+    "budget_conscious": "Write a query that clearly states a budget range and value-for-money priorities.",
+    "comparison": "Write a query that compares 2-3 alternatives or asks 'which is better' with criteria.",
+    "compatibility": "Write a query emphasizing compatibility requirements (model, interface, size, format).",
+    "beginner_friendly": "Write a query as a beginner asking for easy-to-use, low-risk recommendations.",
+    "pro_grade": "Write a query as an experienced user emphasizing performance, durability, and pro features.",
+    "minimalist": "Write a very short query in 4-10 words, focusing only on the core product and 1 key constraint.",
 }
 
 
@@ -119,9 +125,6 @@ Task:
 
 Style requirement:
 {style_hint}
-
-User ID:
-{user_id}
 
 User history (older interactions only):
 {format_history(history)}

@@ -9,8 +9,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from heapq import nlargest
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 from openai import OpenAI
 from config_loader import ApiConfig, load_api_config
@@ -18,8 +17,10 @@ from config_loader import ApiConfig, load_api_config
 
 PITCH_STYLE_GUIDES = {
     "honest": "Use a transparent, factual tone. Mention trade-offs when relevant and avoid hype.",
-    "exaggerated": "Use a promotional, high-energy tone while staying plausible and not inventing specs.",
-    "unconstrained": "No extra style constraints. Write naturally in your own preferred persuasive style.",
+    "expert": "Use a calm, expert tone. Highlight the most decision-critical specs and who it's for.",
+    "concise": "Be extremely concise: one sentence, no fluff, focus on the single strongest reason.",
+    "friendly": "Use a warm, friendly tone. Make it easy to understand and avoid jargon.",
+    "promo": "Use a promotional, high-energy tone while staying plausible and not inventing specs.",
 }
 
 
@@ -53,37 +54,6 @@ class PlatformCandidate:
     pitch_style: str
     retrieval_score: float
     forced_intended_hit: bool
-
-
-@dataclass
-class BM25Index:
-    postings: Dict[str, List[Tuple[int, int]]]  # token -> [(doc_id, tf)]
-    doc_len: List[int]
-    idf: Dict[str, float]
-    avgdl: float
-    k1: float
-    b: float
-
-    def topk(self, query: str, k: int) -> List[Tuple[int, float]]:
-        q_tokens = tokenize(query)
-        if not q_tokens:
-            return []
-
-        scores: Dict[int, float] = {}
-        for tok in q_tokens:
-            plist = self.postings.get(tok)
-            if not plist:
-                continue
-            idf = self.idf.get(tok, 0.0)
-            for doc_id, tf in plist:
-                dl = self.doc_len[doc_id]
-                denom = tf + self.k1 * (1.0 - self.b + self.b * (dl / self.avgdl))
-                s = idf * (tf * (self.k1 + 1.0)) / (denom if denom else 1.0)
-                scores[doc_id] = scores.get(doc_id, 0.0) + s
-
-        if not scores:
-            return []
-        return nlargest(k, scores.items(), key=lambda x: x[1])
 
 
 def parse_args() -> argparse.Namespace:
@@ -139,34 +109,38 @@ def parse_args() -> argparse.Namespace:
         help="Max items loaded per platform; 0 means load all",
     )
     parser.add_argument(
-        "--hash-embedding-dim",
+        "--embedding-model",
+        type=str,
+        default="BAAI/bge-base-en-v1.5",
+        help="HuggingFace SentenceTransformer model name for dense embeddings",
+    )
+    parser.add_argument(
+        "--embedding-local-only",
+        action="store_true",
+        help="Only load embedding model from local files (no network)",
+    )
+    parser.add_argument(
+        "--embedding-device",
+        type=str,
+        default="cpu",
+        help="Device for embedding model: cpu or cuda",
+    )
+    parser.add_argument(
+        "--embedding-batch-size",
         type=int,
-        default=512,
-        help="Dimension for hash-based embedding retrieval",
+        default=64,
+        help="Batch size for embedding encoding",
     )
     parser.add_argument(
-        "--hybrid-alpha",
-        type=float,
-        default=0.45,
-        help="Hybrid score weight for BM25 vs vector (alpha*bm25 + (1-alpha)*vector)",
-    )
-    parser.add_argument(
-        "--hybrid-topk",
+        "--embedding-max-seq-length",
         type=int,
-        default=200,
-        help="BM25 candidate pool size for hybrid retrieval (topK by BM25)",
+        default=256,
+        help="Max sequence length for embedding model",
     )
     parser.add_argument(
-        "--bm25-k1",
-        type=float,
-        default=1.2,
-        help="BM25 k1 parameter",
-    )
-    parser.add_argument(
-        "--bm25-b",
-        type=float,
-        default=0.75,
-        help="BM25 b parameter",
+        "--embedding-show-progress",
+        action="store_true",
+        help="Show embedding encode progress bar",
     )
     parser.add_argument(
         "--max-retries",
@@ -221,6 +195,7 @@ def hash_embedding(text: str, dim: int) -> List[float]:
 
 
 def cosine(a: Sequence[float], b: Sequence[float]) -> float:
+    # Deprecated: kept for backward compatibility with earlier experiments.
     return sum(x * y for x, y in zip(a, b))
 
 
@@ -298,11 +273,18 @@ def parse_rank_list(text: str, valid_ids: List[str]) -> Optional[List[str]]:
     return None
 
 
-def choose_pitch_style(seed_text: str) -> str:
-    styles = sorted(PITCH_STYLE_GUIDES.keys())
-    digest = hashlib.md5(seed_text.encode("utf-8")).hexdigest()
-    idx = int(digest[:8], 16) % len(styles)
-    return styles[idx]
+def choose_pitch_style(platform_id: str) -> str:
+    platform_style_map = {
+        "P1": "honest",
+        "P2": "expert",
+        "P3": "concise",
+        "P4": "friendly",
+        "P5": "promo",
+    }
+    style = platform_style_map.get(platform_id)
+    if style in PITCH_STYLE_GUIDES:
+        return style
+    return "honest"
 
 
 def build_item_from_obj(obj: Dict) -> Item:
@@ -342,58 +324,18 @@ def item_retrieval_text(item: Item) -> str:
     return clean_text(" ".join(p for p in parts if p), 2200)
 
 
-def build_bm25_index(
-    docs: List[str],
-    k1: float,
-    b: float,
-) -> BM25Index:
-    postings: Dict[str, List[Tuple[int, int]]] = {}
-    df: Dict[str, int] = {}
-    doc_len: List[int] = []
-
-    for doc_id, text in enumerate(docs):
-        toks = tokenize(text)
-        doc_len.append(len(toks))
-        if not toks:
-            continue
-        tf_map: Dict[str, int] = {}
-        for t in toks:
-            tf_map[t] = tf_map.get(t, 0) + 1
-        for t, tf in tf_map.items():
-            postings.setdefault(t, []).append((doc_id, tf))
-        for t in tf_map.keys():
-            df[t] = df.get(t, 0) + 1
-
-    n_docs = max(1, len(docs))
-    avgdl = sum(doc_len) / n_docs if doc_len else 1.0
-
-    idf: Dict[str, float] = {}
-    for t, dft in df.items():
-        # BM25+ style IDF, stable for rare/very common terms
-        idf[t] = math.log(1.0 + (n_docs - dft + 0.5) / (dft + 0.5))
-
-    return BM25Index(
-        postings=postings,
-        doc_len=doc_len if doc_len else [1] * n_docs,
-        idf=idf,
-        avgdl=avgdl if avgdl > 0 else 1.0,
-        k1=k1,
-        b=b,
-    )
-
-
 def load_platform_items(
     platform_file: Path,
     max_items: int,
-    emb_dim: int,
-    bm25_k1: float,
-    bm25_b: float,
-) -> Tuple[List[Item], Dict[str, Item], List[List[float]], BM25Index]:
+    embedder,
+    embedding_batch_size: int,
+    embedding_show_progress: bool,
+) -> Tuple[List[Item], Dict[str, Item], "np.ndarray"]:
     items: List[Item] = []
     asin_map: Dict[str, Item] = {}
-    vectors: List[List[float]] = []
     doc_texts: List[str] = []
 
+    t_read0 = time.time()
     with platform_file.open("r", encoding="utf-8") as f:
         for i, line in enumerate(f, start=1):
             if max_items and len(items) >= max_items:
@@ -403,14 +345,28 @@ def load_platform_items(
             if not item.parent_asin:
                 continue
             text = item_retrieval_text(item)
-            vec = hash_embedding(text, emb_dim)
             items.append(item)
             asin_map[item.parent_asin] = item
-            vectors.append(vec)
             doc_texts.append(text)
 
-    bm25 = build_bm25_index(doc_texts, k1=bm25_k1, b=bm25_b)
-    return items, asin_map, vectors, bm25
+    # Dense embeddings (normalized) for cosine via dot product.
+    import numpy as np
+
+    if not doc_texts:
+        vectors = np.zeros((0, 1), dtype=np.float32)
+    else:
+        print(f"  embedding_start docs={len(doc_texts)} batch={embedding_batch_size}")
+        t0 = time.time()
+        vectors = embedder.encode(
+            doc_texts,
+            batch_size=max(1, int(embedding_batch_size)),
+            normalize_embeddings=True,
+            show_progress_bar=bool(embedding_show_progress),
+        ).astype(np.float32, copy=False)
+        dt = time.time() - t0
+        if dt > 0:
+            print(f"  embedding_done docs={len(doc_texts)} dim={vectors.shape[1]} time_s={dt:.1f} docs_per_s={len(doc_texts)/dt:.1f}")
+    return items, asin_map, vectors
 
 
 def ua_structure_query(
@@ -423,16 +379,22 @@ def ua_structure_query(
     style = query_record.get("query_style", "")
 
     user_prompt = f"""
-Convert the following user query into a structured JSON object for downstream
-platform retrieval.
-Output JSON only. No markdown, no extra commentary.
+Convert the following user query into a structured JSON object for downstream retrieval.
+Output JSON only (no markdown, no extra keys).
 
-Required fields:
-- user_need: core user need as a short sentence
-- query_rewrite: retrieval-oriented rewritten query
-- keywords: array of 3-8 keywords
-- constraints: array of 0-5 constraints (compatibility, budget, usage context, etc.)
-- style: keep the original user expression style
+Schema (types + limits):
+- user_need: string (<= 25 words)
+- query_rewrite: string (<= 25 words). Keep meaning; do NOT add new brands/models/specs not implied by the query.
+- keywords: array of 3-8 short keyword phrases (nouns or noun-phrases). Avoid adjectives-only.
+- constraints: array of 0-5 short constraints .
+
+Example output:
+{{
+  "user_need": "A beginner-friendly electric guitar bundle for home practice",
+  "query_rewrite": "beginner electric guitar starter kit for home practice",
+  "keywords": ["electric guitar", "starter kit", "beginner", "home practice"],
+  "constraints": ["easy to set up", "includes essentials", "quiet practice option"]
+}}
 
 Input:
 query_text={query}
@@ -465,11 +427,8 @@ query_text={query}
 def retrieve_top1(
     ua_structured: Dict,
     items: List[Item],
-    vectors: List[List[float]],
-    emb_dim: int,
-    bm25: BM25Index,
-    hybrid_alpha: float,
-    hybrid_topk: int,
+    vectors,
+    embedder,
 ) -> Tuple[Item, float]:
     if not items:
         raise ValueError("Platform has no items loaded")
@@ -482,50 +441,16 @@ def retrieve_top1(
             str(ua_structured.get("user_need") or ""),
         ]
     )
-    qvec = hash_embedding(qtext, emb_dim)
+    import numpy as np
 
-    # Stage 1: BM25 candidate pool (no full-scan)
-    candidates = bm25.topk(qtext, k=max(1, hybrid_topk))
-    if not candidates:
-        # Fallback to full scan on hash vectors only if BM25 can't score anything.
-        best_idx = 0
-        best_score = -1e9
-        for idx, ivec in enumerate(vectors):
-            s = cosine(qvec, ivec)
-            if s > best_score:
-                best_score = s
-                best_idx = idx
-        return items[best_idx], best_score
+    qvec = embedder.encode([qtext], normalize_embeddings=True, show_progress_bar=False)
+    qvec = np.asarray(qvec, dtype=np.float32).reshape(-1)
+    if vectors is None or getattr(vectors, "shape", (0,))[0] == 0:
+        raise ValueError("Platform has no embedding vectors loaded")
 
-    bm25_scores = [s for _, s in candidates]
-    bmin, bmax = min(bm25_scores), max(bm25_scores)
-    if bmax > bmin:
-        bm25_norm = {doc_id: (s - bmin) / (bmax - bmin) for doc_id, s in candidates}
-    else:
-        bm25_norm = {doc_id: 0.0 for doc_id, _ in candidates}
-
-    vec_raw: Dict[int, float] = {}
-    for doc_id, _ in candidates:
-        vec_raw[doc_id] = cosine(qvec, vectors[doc_id])
-    vmin, vmax = min(vec_raw.values()), max(vec_raw.values())
-    if vmax > vmin:
-        vec_norm = {doc_id: (s - vmin) / (vmax - vmin) for doc_id, s in vec_raw.items()}
-    else:
-        vec_norm = {doc_id: 0.0 for doc_id, _ in candidates}
-
-    alpha = float(hybrid_alpha)
-    if alpha < 0.0:
-        alpha = 0.0
-    if alpha > 1.0:
-        alpha = 1.0
-
-    best_idx = candidates[0][0]
-    best_score = -1e9
-    for doc_id, _ in candidates:
-        s = alpha * bm25_norm.get(doc_id, 0.0) + (1.0 - alpha) * vec_norm.get(doc_id, 0.0)
-        if s > best_score:
-            best_score = s
-            best_idx = doc_id
+    scores = vectors @ qvec
+    best_idx = int(scores.argmax())
+    best_score = float(scores[best_idx])
     return items[best_idx], best_score
 
 
@@ -652,19 +577,19 @@ def generate_reputation_memory(
     target_rank: int,
 ) -> str:
     prompt = f"""
-You are a platform reputation logger. Generate one short memory note in English
-(max 20 words). Output one sentence only.
+You are a platform reputation logger. Write ONE short English memory note (one sentence, <= 28 words).
+It should be specific enough to help future ranking, but avoid claiming certainty beyond the evidence.
 
 event_type={event_type}
 platform_id={platform_id}
 user_query={user_query}
-item_title={item_title}
+recommended_item_title={item_title}
 rank_pos={rank_pos}
 target_rank={target_rank}
 
 Rules:
-- penalty: emphasize "ranked ahead but missed true target, possible over-marketing risk"
-- reward: emphasize "hit true need, recommendation is trustworthy"
+- penalty: mention it was ranked ahead of the target but missed the intended match; add ONE plausible mismatch hint (e.g., wrong type, missing compatibility, budget mismatch), phrased as "may".
+- reward: mention it matched the intended need; add ONE concrete helpful aspect aligned with the query (e.g., compatibility, use-case fit), without inventing specs.
 """.strip()
     try:
         return llm_chat_json(
@@ -719,12 +644,8 @@ def run_simulation(args: argparse.Namespace) -> None:
         raise ValueError("--intended-hit-prob must be in [0, 1]")
     if args.profile_window_size <= 0:
         raise ValueError("--profile-window-size must be > 0")
-    if args.hybrid_topk <= 0:
-        raise ValueError("--hybrid-topk must be > 0")
-    if args.bm25_k1 <= 0:
-        raise ValueError("--bm25-k1 must be > 0")
-    if not (0.0 <= args.bm25_b <= 1.0):
-        raise ValueError("--bm25-b must be in [0, 1]")
+    if args.embedding_batch_size <= 0:
+        raise ValueError("--embedding-batch-size must be > 0")
 
     random.seed(args.seed)
 
@@ -744,16 +665,42 @@ def run_simulation(args: argparse.Namespace) -> None:
     client = OpenAI(base_url=api.base_url, api_key=api.api_key, timeout=api.timeout_seconds)
     chat_model = api.default_model
 
+    print(f"Loading embedding model: {args.embedding_model} (device={args.embedding_device})")
+    try:
+        from sentence_transformers import SentenceTransformer  # type: ignore
+    except Exception as err:
+        raise RuntimeError(
+            "Missing dependency: sentence-transformers. Install with `pip install -U sentence-transformers`."
+        ) from err
+    try:
+        embedder = SentenceTransformer(
+            args.embedding_model,
+            device=args.embedding_device,
+            local_files_only=bool(args.embedding_local_only),
+        )
+    except TypeError:
+        # Older sentence-transformers versions may not support local_files_only.
+        if args.embedding_local_only:
+            raise RuntimeError(
+                "Your sentence-transformers version doesn't support local_files_only. "
+                "Please upgrade with `pip install -U sentence-transformers`."
+            )
+        embedder = SentenceTransformer(args.embedding_model, device=args.embedding_device)
+    if args.embedding_max_seq_length > 0:
+        embedder.max_seq_length = int(args.embedding_max_seq_length)
+        print(f"Embedding max_seq_length set to {embedder.max_seq_length}")
+
     print("Loading platform catalogs and building retrieval vectors...")
     platform_data = {}
     for idx, pfile in enumerate(platform_files):
         pid = platform_ids[idx]
-        items, asin_map, vectors, bm25 = load_platform_items(
+        print(f"{pid}: reading_items+embedding from {pfile} ...")
+        items, asin_map, vectors = load_platform_items(
             platform_file=pfile,
             max_items=args.max_platform_items,
-            emb_dim=args.hash_embedding_dim,
-            bm25_k1=args.bm25_k1,
-            bm25_b=args.bm25_b,
+            embedder=embedder,
+            embedding_batch_size=args.embedding_batch_size,
+            embedding_show_progress=args.embedding_show_progress,
         )
         if not items:
             raise RuntimeError(f"{pid} has no loaded items: {pfile}")
@@ -761,7 +708,6 @@ def run_simulation(args: argparse.Namespace) -> None:
             "items": items,
             "asin_map": asin_map,
             "vectors": vectors,
-            "bm25": bm25,
         }
         print(f"{pid}: loaded_items={len(items)}")
 
@@ -871,8 +817,7 @@ def run_simulation(args: argparse.Namespace) -> None:
                     pdata = platform_data[pid]
                     asin_map: Dict[str, Item] = pdata["asin_map"]
                     items: List[Item] = pdata["items"]
-                    vectors: List[List[float]] = pdata["vectors"]
-                    bm25: BM25Index = pdata["bm25"]
+                    vectors = pdata["vectors"]
 
                     forced_hit = False
                     if pid in intended_hit_pids:
@@ -884,13 +829,10 @@ def run_simulation(args: argparse.Namespace) -> None:
                             ua_structured=ua_struct,
                             items=items,
                             vectors=vectors,
-                            emb_dim=args.hash_embedding_dim,
-                            bm25=bm25,
-                            hybrid_alpha=args.hybrid_alpha,
-                            hybrid_topk=args.hybrid_topk,
+                            embedder=embedder,
                         )
 
-                    style = choose_pitch_style(f"{query_id}|{pid}")
+                    style = choose_pitch_style(pid)
                     pitch = generate_platform_pitch(
                         client=client,
                         model=chat_model,
@@ -1081,10 +1023,9 @@ def run_simulation(args: argparse.Namespace) -> None:
         "intended_hit_prob": args.intended_hit_prob,
         "profile_window_size": args.profile_window_size,
         "max_platform_items": args.max_platform_items,
-        "hybrid_alpha": args.hybrid_alpha,
-        "hybrid_topk": args.hybrid_topk,
-        "bm25_k1": args.bm25_k1,
-        "bm25_b": args.bm25_b,
+        "embedding_model": args.embedding_model,
+        "embedding_device": args.embedding_device,
+        "embedding_batch_size": args.embedding_batch_size,
         "seed": args.seed,
     }
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
