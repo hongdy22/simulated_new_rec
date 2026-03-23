@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 import argparse
+import gc
 import hashlib
 import json
 import math
 import random
 import re
 import sys
-import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
@@ -24,6 +24,10 @@ PITCH_STYLE_GUIDES = {
     "friendly": "Use a warm, friendly tone. Make it easy to understand and avoid jargon.",
     "promo": "Use a promotional, high-energy tone while staying plausible and not inventing specs.",
 }
+
+
+CACHE_FORMAT_VERSION = 1
+RETRIEVAL_TEXT_VERSION = 1
 
 
 @dataclass
@@ -58,6 +62,307 @@ class PlatformCandidate:
     forced_intended_hit: bool
 
 
+def item_to_cache_payload(item: Item) -> Dict:
+    return {
+        "parent_asin": item.parent_asin,
+        "title": item.title,
+        "main_category": item.main_category,
+        "average_rating": item.average_rating,
+        "rating_number": item.rating_number,
+        "description": item.description,
+        "reviews": item.reviews,
+    }
+
+
+def item_from_cache_payload(obj: Dict) -> Item:
+    return Item(
+        parent_asin=str(obj.get("parent_asin") or ""),
+        title=clean_text(obj.get("title"), 300),
+        main_category=clean_text(obj.get("main_category"), 120),
+        average_rating=obj.get("average_rating"),
+        rating_number=obj.get("rating_number"),
+        description=clean_text(obj.get("description"), 1200),
+        reviews=[clean_text(x, 220) for x in (obj.get("reviews") or []) if clean_text(x, 220)],
+    )
+
+
+def resolve_embedding_device(requested_device: str) -> str:
+    requested = (requested_device or "auto").strip().lower()
+    if requested != "auto":
+        return requested
+
+    try:
+        import torch  # type: ignore
+
+        if torch.cuda.is_available():
+            return "cuda"
+        mps = getattr(torch.backends, "mps", None)
+        if mps is not None and torch.backends.mps.is_available():
+            return "mps"
+    except Exception:
+        pass
+
+    return "cpu"
+
+
+def create_embedder(
+    embedding_model: str,
+    embedding_device: str,
+    embedding_local_only: bool,
+    embedding_max_seq_length: int,
+    log_prefix: str = "",
+):
+    try:
+        from sentence_transformers import SentenceTransformer  # type: ignore
+    except Exception as err:
+        raise RuntimeError(
+            "Missing dependency: sentence-transformers. Install with `pip install -U sentence-transformers`."
+        ) from err
+
+    try:
+        embedder = SentenceTransformer(
+            embedding_model,
+            device=embedding_device,
+            local_files_only=bool(embedding_local_only),
+        )
+    except TypeError:
+        # Older sentence-transformers versions may not support local_files_only.
+        if embedding_local_only:
+            raise RuntimeError(
+                "Your sentence-transformers version doesn't support local_files_only. "
+                "Please upgrade with `pip install -U sentence-transformers`."
+            )
+        embedder = SentenceTransformer(embedding_model, device=embedding_device)
+
+    if embedding_max_seq_length > 0:
+        embedder.max_seq_length = int(embedding_max_seq_length)
+        print(f"{log_prefix}Embedding max_seq_length set to {embedder.max_seq_length}")
+
+    return embedder
+
+
+def cleanup_embedder(embedder, embedding_device: str) -> None:
+    del embedder
+    gc.collect()
+    try:
+        import torch  # type: ignore
+
+        if str(embedding_device).startswith("cuda") and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+def parse_platform_embedding_devices(
+    embedding_device: str,
+    gpu_ids_text: str,
+) -> List[str]:
+    requested = str(gpu_ids_text or "").strip()
+    if not requested:
+        return [embedding_device]
+
+    if not str(embedding_device).startswith("cuda"):
+        print(
+            f"Ignoring --platform-embedding-gpu-ids={requested!r} because embedding device resolved to {embedding_device}."
+        )
+        return [embedding_device]
+
+    tokens = [tok.strip() for tok in requested.replace(" ", ",").split(",") if tok.strip()]
+    if not tokens:
+        return [embedding_device]
+
+    devices: List[str] = []
+    seen = set()
+    for tok in tokens:
+        try:
+            gpu_id = int(tok)
+        except ValueError as err:
+            raise ValueError(f"Invalid GPU id in --platform-embedding-gpu-ids: {tok!r}") from err
+        if gpu_id < 0:
+            raise ValueError(f"GPU id must be >= 0, got {gpu_id}")
+        device = f"cuda:{gpu_id}"
+        if device not in seen:
+            devices.append(device)
+            seen.add(device)
+
+    return devices or [embedding_device]
+
+
+def assign_platforms_to_devices(
+    platform_ids: List[str],
+    platform_files: List[Path],
+    devices: List[str],
+) -> Dict[str, List[Tuple[str, Path]]]:
+    assignments = {device: [] for device in devices}
+    for idx, payload in enumerate(zip(platform_ids, platform_files)):
+        device = devices[idx % len(devices)]
+        assignments[device].append(payload)
+    return assignments
+
+
+def parse_platform_cache_dir(cache_dir_text: str) -> Optional[Path]:
+    text = str(cache_dir_text or "").strip()
+    if not text:
+        return None
+    return Path(text)
+
+
+def platform_cache_paths(cache_dir: Path, platform_id: str) -> Dict[str, Path]:
+    return {
+        "meta": cache_dir / f"{platform_id}.meta.json",
+        "items": cache_dir / f"{platform_id}.items.jsonl",
+        "vectors": cache_dir / f"{platform_id}.vectors.npy",
+    }
+
+
+def build_platform_cache_metadata(
+    platform_id: str,
+    platform_file: Path,
+    max_items: int,
+    embedding_model: str,
+    embedding_max_seq_length: int,
+    item_count: int,
+    vector_dim: int,
+) -> Dict:
+    stat = platform_file.stat()
+    return {
+        "cache_format_version": CACHE_FORMAT_VERSION,
+        "retrieval_text_version": RETRIEVAL_TEXT_VERSION,
+        "platform_id": platform_id,
+        "platform_file": str(platform_file.resolve()),
+        "platform_file_size": stat.st_size,
+        "platform_file_mtime_ns": stat.st_mtime_ns,
+        "max_items": int(max_items),
+        "embedding_model": embedding_model,
+        "embedding_max_seq_length": int(embedding_max_seq_length),
+        "item_count": int(item_count),
+        "vector_dim": int(vector_dim),
+    }
+
+
+def write_json_atomic(path: Path, obj: Dict) -> None:
+    tmp_path = path.with_name(path.name + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+    tmp_path.replace(path)
+
+
+def write_jsonl_atomic(path: Path, rows: Iterable[Dict]) -> None:
+    tmp_path = path.with_name(path.name + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    tmp_path.replace(path)
+
+
+def save_platform_cache(
+    cache_dir: Path,
+    platform_id: str,
+    platform_file: Path,
+    items: List[Item],
+    vectors,
+    max_items: int,
+    embedding_model: str,
+    embedding_max_seq_length: int,
+) -> None:
+    import numpy as np
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    paths = platform_cache_paths(cache_dir, platform_id)
+    meta = build_platform_cache_metadata(
+        platform_id=platform_id,
+        platform_file=platform_file,
+        max_items=max_items,
+        embedding_model=embedding_model,
+        embedding_max_seq_length=embedding_max_seq_length,
+        item_count=len(items),
+        vector_dim=int(vectors.shape[1]) if getattr(vectors, "ndim", 0) == 2 else 0,
+    )
+
+    vectors_tmp = paths["vectors"].with_name(paths["vectors"].name + ".tmp")
+    with vectors_tmp.open("wb") as f:
+        np.save(f, np.asarray(vectors, dtype=np.float32), allow_pickle=False)
+
+    write_jsonl_atomic(paths["items"], (item_to_cache_payload(item) for item in items))
+    vectors_tmp.replace(paths["vectors"])
+    write_json_atomic(paths["meta"], meta)
+
+
+def load_platform_cache(
+    cache_dir: Path,
+    platform_id: str,
+    platform_file: Path,
+    max_items: int,
+    embedding_model: str,
+    embedding_max_seq_length: int,
+) -> Optional[Tuple[List[Item], Dict[str, Item], "np.ndarray"]]:
+    import numpy as np
+
+    paths = platform_cache_paths(cache_dir, platform_id)
+    if not all(path.exists() for path in paths.values()):
+        print(f"{platform_id}: cache miss, rebuilding")
+        return None
+
+    try:
+        meta = json.loads(paths["meta"].read_text(encoding="utf-8"))
+    except Exception as err:
+        print(f"{platform_id}: cache meta unreadable ({err}), rebuilding")
+        return None
+
+    expected_meta = build_platform_cache_metadata(
+        platform_id=platform_id,
+        platform_file=platform_file,
+        max_items=max_items,
+        embedding_model=embedding_model,
+        embedding_max_seq_length=embedding_max_seq_length,
+        item_count=int(meta.get("item_count") or 0),
+        vector_dim=int(meta.get("vector_dim") or 0),
+    )
+    for key in (
+        "cache_format_version",
+        "retrieval_text_version",
+        "platform_id",
+        "platform_file",
+        "platform_file_size",
+        "platform_file_mtime_ns",
+        "max_items",
+        "embedding_model",
+        "embedding_max_seq_length",
+    ):
+        if meta.get(key) != expected_meta.get(key):
+            print(f"{platform_id}: cache invalid ({key} mismatch), rebuilding")
+            return None
+
+    try:
+        items: List[Item] = []
+        asin_map: Dict[str, Item] = {}
+        with paths["items"].open("r", encoding="utf-8") as f:
+            for line in f:
+                item = item_from_cache_payload(json.loads(line))
+                items.append(item)
+                asin_map[item.parent_asin] = item
+
+        with paths["vectors"].open("rb") as f:
+            vectors = np.load(f, allow_pickle=False)
+        vectors = np.asarray(vectors, dtype=np.float32)
+    except Exception as err:
+        print(f"{platform_id}: cache payload unreadable ({err}), rebuilding")
+        return None
+
+    if len(items) != int(meta.get("item_count") or -1):
+        print(f"{platform_id}: cache invalid (item_count mismatch), rebuilding")
+        return None
+    if getattr(vectors, "ndim", 0) != 2 or vectors.shape[0] != len(items):
+        print(f"{platform_id}: cache invalid (vector shape mismatch), rebuilding")
+        return None
+    if len(items) and vectors.shape[1] != int(meta.get("vector_dim") or -1):
+        print(f"{platform_id}: cache invalid (vector_dim mismatch), rebuilding")
+        return None
+
+    print(f"{platform_id}: loaded_items={len(items)} from cache")
+    return items, asin_map, vectors
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run UA-PA simulation: structured query, platform recall, UA ranking, settlement."
@@ -75,6 +380,12 @@ def parse_args() -> argparse.Namespace:
         help="Directory containing platform_1.jsonl ... platform_5.jsonl",
     )
     parser.add_argument(
+        "--platform-cache-dir",
+        type=str,
+        default="./output/platform_cache",
+        help="Optional cache directory for platform retrieval vectors. Empty means rebuild embeddings.",
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         default=Path("./output/sim"),
@@ -83,7 +394,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-queries",
         type=int,
-        default=5,
+        default=2,
         help="Maximum number of queries to run. 0 means all",
     )
     parser.add_argument(
@@ -107,7 +418,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-platform-items",
         type=int,
-        default=4000,
+        default=30000,
         help="Max items loaded per platform; 0 means load all",
     )
     parser.add_argument(
@@ -124,13 +435,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--embedding-device",
         type=str,
-        default="cpu",
-        help="Device for embedding model: cpu or cuda",
+        default="auto",
+        help="Device for embedding model: auto, cpu, cuda, or mps",
+    )
+    parser.add_argument(
+        "--platform-embedding-gpu-ids",
+        type=str,
+        default="0,1,2,3,4",
+        help="Comma-separated GPU ids for platform catalog embedding, e.g. 0,1,2. If empty, use a single resolved embedding device.",
     )
     parser.add_argument(
         "--embedding-batch-size",
         type=int,
-        default=64,
+        default=1024,
         help="Batch size for embedding encoding",
     )
     parser.add_argument(
@@ -142,6 +459,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--embedding-show-progress",
         action="store_true",
+        default=True,
         help="Show embedding encode progress bar",
     )
     parser.add_argument(
@@ -387,6 +705,31 @@ def load_platform_items(
     return items, asin_map, vectors
 
 
+def load_platform_items_group_worker(
+    embedding_device: str,
+    assigned_platforms: List[Tuple[str, Path]],
+    embedder,
+    max_items: int,
+    embedding_batch_size: int,
+    embedding_show_progress: bool,
+) -> Dict[str, Tuple[List[Item], Dict[str, Item], "np.ndarray"]]:
+    results: Dict[str, Tuple[List[Item], Dict[str, Item], "np.ndarray"]] = {}
+    for pid, platform_file in assigned_platforms:
+        print(f"{pid}: assigned_device={embedding_device}")
+        print(f"{pid}: reading_items+embedding from {platform_file} ...")
+        items, asin_map, vectors = load_platform_items(
+            platform_file=platform_file,
+            max_items=max_items,
+            embedder=embedder,
+            embedding_batch_size=embedding_batch_size,
+            embedding_show_progress=embedding_show_progress,
+        )
+        print(f"{pid}: loaded_items={len(items)}")
+        results[pid] = (items, asin_map, vectors)
+
+    return results
+
+
 def ua_structure_query(
     client: OpenAI,
     model: str,
@@ -453,15 +796,14 @@ def build_query_embedding_text(ua_structured: Dict) -> str:
     )
 
 
-def encode_query_vector(ua_structured: Dict, embedder, embedder_lock: threading.Lock):
+def encode_query_vector(ua_structured: Dict, embedder):
     import numpy as np
 
-    with embedder_lock:
-        qvec = embedder.encode(
-            [build_query_embedding_text(ua_structured)],
-            normalize_embeddings=True,
-            show_progress_bar=False,
-        )
+    qvec = embedder.encode(
+        [build_query_embedding_text(ua_structured)],
+        normalize_embeddings=True,
+        show_progress_bar=False,
+    )
     return np.asarray(qvec, dtype=np.float32).reshape(-1)
 
 
@@ -540,6 +882,126 @@ def serialize_candidate(candidate: PlatformCandidate) -> Dict:
     }
 
 
+def build_platform_candidate(
+    api: ApiConfig,
+    chat_model: str,
+    max_retries: int,
+    pid: str,
+    ua_struct: Dict,
+    target_asin: str,
+    intended_hit_pids: List[str],
+    platform_data: Dict[str, Dict],
+    qvec,
+) -> PlatformCandidate:
+    pdata = platform_data[pid]
+    asin_map: Dict[str, Item] = pdata["asin_map"]
+    items: List[Item] = pdata["items"]
+    vectors = pdata["vectors"]
+
+    forced_hit = False
+    if pid in intended_hit_pids:
+        chosen = asin_map[target_asin]
+        score = 1.0
+        forced_hit = True
+    else:
+        chosen, score = retrieve_top1(items=items, vectors=vectors, qvec=qvec)
+
+    style = choose_pitch_style(pid)
+    pitch = generate_platform_pitch(
+        client=make_client(api),
+        model=chat_model,
+        max_retries=max_retries,
+        platform_id=pid,
+        ua_structured=ua_struct,
+        item=chosen,
+        pitch_style=style,
+    )
+    return PlatformCandidate(
+        platform_id=pid,
+        item=chosen,
+        pitch=pitch,
+        pitch_style=style,
+        retrieval_score=score,
+        forced_intended_hit=forced_hit,
+    )
+
+
+def parallel_generate_platform_candidates(
+    api: ApiConfig,
+    chat_model: str,
+    max_retries: int,
+    platform_ids: List[str],
+    ua_struct: Dict,
+    target_asin: str,
+    intended_hit_pids: List[str],
+    platform_data: Dict[str, Dict],
+    qvec,
+) -> List[PlatformCandidate]:
+    with ThreadPoolExecutor(max_workers=max(1, len(platform_ids))) as executor:
+        futures = [
+            executor.submit(
+                build_platform_candidate,
+                api,
+                chat_model,
+                max_retries,
+                pid,
+                ua_struct,
+                target_asin,
+                intended_hit_pids,
+                platform_data,
+                qvec,
+            )
+            for pid in platform_ids
+        ]
+        return [future.result() for future in futures]
+
+
+def parallel_generate_reputation_memories(
+    api: ApiConfig,
+    chat_model: str,
+    max_retries: int,
+    user_query: str,
+    candidate_map: Dict[str, PlatformCandidate],
+    rank_list: List[str],
+    reward_pid: str,
+    penalty_pids: List[str],
+    target_rank: int,
+) -> List[Tuple[str, str]]:
+    event_specs: List[Tuple[str, str, str, int]] = []
+    for pos, pid in enumerate(rank_list, start=1):
+        event_type = None
+        if pid in penalty_pids:
+            event_type = "penalty"
+        elif pid == reward_pid:
+            event_type = "reward"
+        if event_type is None:
+            continue
+        event_specs.append((pid, event_type, candidate_map[pid].item.title, pos))
+
+    if not event_specs:
+        return []
+
+    with ThreadPoolExecutor(max_workers=max(1, len(event_specs))) as executor:
+        futures = [
+            executor.submit(
+                generate_reputation_memory,
+                client=make_client(api),
+                model=chat_model,
+                max_retries=max_retries,
+                event_type=event_type,
+                platform_id=pid,
+                user_query=user_query,
+                item_title=item_title,
+                rank_pos=pos,
+                target_rank=target_rank,
+            )
+            for pid, event_type, item_title, pos in event_specs
+        ]
+        memories = [future.result() for future in futures]
+
+    return [(pid, mem) for (pid, _, _, _), mem in zip(event_specs, memories)]
+
+
 def prepare_round(
     qrec: Dict,
     line_no: int,
@@ -552,7 +1014,6 @@ def prepare_round(
     platform_ids: List[str],
     platform_data: Dict[str, Dict],
     embedder,
-    embedder_lock: threading.Lock,
 ) -> Dict:
     user_query = str(qrec.get("query_text") or "")
     target_item = qrec.get("target_item") or {}
@@ -570,9 +1031,8 @@ def prepare_round(
         if sleep_seconds > 0:
             time.sleep(sleep_seconds)
 
-        client = make_client(api)
         ua_struct = ua_structure_query(
-            client=client,
+            client=make_client(api),
             model=chat_model,
             max_retries=max_retries,
             query_record=qrec,
@@ -607,42 +1067,18 @@ def prepare_round(
             )
             return {"round_obj": round_obj}
 
-        qvec = encode_query_vector(ua_struct, embedder, embedder_lock)
-        candidates: List[PlatformCandidate] = []
-        for pid in platform_ids:
-            pdata = platform_data[pid]
-            asin_map: Dict[str, Item] = pdata["asin_map"]
-            items: List[Item] = pdata["items"]
-            vectors = pdata["vectors"]
-
-            forced_hit = False
-            if pid in intended_hit_pids:
-                chosen = asin_map[target_asin]
-                score = 1.0
-                forced_hit = True
-            else:
-                chosen, score = retrieve_top1(items=items, vectors=vectors, qvec=qvec)
-
-            style = choose_pitch_style(pid)
-            pitch = generate_platform_pitch(
-                client=client,
-                model=chat_model,
-                max_retries=max_retries,
-                platform_id=pid,
-                ua_structured=ua_struct,
-                item=chosen,
-                pitch_style=style,
-            )
-            candidates.append(
-                PlatformCandidate(
-                    platform_id=pid,
-                    item=chosen,
-                    pitch=pitch,
-                    pitch_style=style,
-                    retrieval_score=score,
-                    forced_intended_hit=forced_hit,
-                )
-            )
+        qvec = encode_query_vector(ua_struct, embedder)
+        candidates = parallel_generate_platform_candidates(
+            api=api,
+            chat_model=chat_model,
+            max_retries=max_retries,
+            platform_ids=platform_ids,
+            ua_struct=ua_struct,
+            target_asin=target_asin,
+            intended_hit_pids=intended_hit_pids,
+            platform_data=platform_data,
+            qvec=qvec,
+        )
 
         intended_platforms = [
             candidate.platform_id
@@ -834,53 +1270,136 @@ def run_simulation(args: argparse.Namespace) -> None:
     client = make_client(api)
     chat_model = api.default_model
 
-    print(f"Loading embedding model: {args.embedding_model} (device={args.embedding_device})")
-    try:
-        from sentence_transformers import SentenceTransformer  # type: ignore
-    except Exception as err:
-        raise RuntimeError(
-            "Missing dependency: sentence-transformers. Install with `pip install -U sentence-transformers`."
-        ) from err
-    try:
-        embedder = SentenceTransformer(
-            args.embedding_model,
-            device=args.embedding_device,
-            local_files_only=bool(args.embedding_local_only),
-        )
-    except TypeError:
-        # Older sentence-transformers versions may not support local_files_only.
-        if args.embedding_local_only:
-            raise RuntimeError(
-                "Your sentence-transformers version doesn't support local_files_only. "
-                "Please upgrade with `pip install -U sentence-transformers`."
-            )
-        embedder = SentenceTransformer(args.embedding_model, device=args.embedding_device)
-    if args.embedding_max_seq_length > 0:
-        embedder.max_seq_length = int(args.embedding_max_seq_length)
-        print(f"Embedding max_seq_length set to {embedder.max_seq_length}")
+    requested_embedding_device = args.embedding_device
+    embedding_device = resolve_embedding_device(requested_embedding_device)
+    args.embedding_device = embedding_device
+    if str(requested_embedding_device).strip().lower() == "auto":
+        print(f"Resolved embedding device automatically: {embedding_device}")
+    platform_cache_dir = parse_platform_cache_dir(args.platform_cache_dir)
+    if platform_cache_dir is not None:
+        print(f"Platform cache directory: {platform_cache_dir}")
 
-    print("Loading platform catalogs and building retrieval vectors...")
     platform_data = {}
-    for idx, pfile in enumerate(platform_files):
-        pid = platform_ids[idx]
-        print(f"{pid}: reading_items+embedding from {pfile} ...")
-        items, asin_map, vectors = load_platform_items(
-            platform_file=pfile,
-            max_items=args.max_platform_items,
-            embedder=embedder,
-            embedding_batch_size=args.embedding_batch_size,
-            embedding_show_progress=args.embedding_show_progress,
-        )
-        if not items:
-            raise RuntimeError(f"{pid} has no loaded items: {pfile}")
-        platform_data[pid] = {
-            "items": items,
-            "asin_map": asin_map,
-            "vectors": vectors,
-        }
-        print(f"{pid}: loaded_items={len(items)}")
+    cache_hits = 0
+    cache_misses = 0
+    pending_platform_entries: List[Tuple[str, Path]] = []
+    for pid, pfile in zip(platform_ids, platform_files):
+        cached = None
+        if platform_cache_dir is not None:
+            cached = load_platform_cache(
+                cache_dir=platform_cache_dir,
+                platform_id=pid,
+                platform_file=pfile,
+                max_items=args.max_platform_items,
+                embedding_model=args.embedding_model,
+                embedding_max_seq_length=args.embedding_max_seq_length,
+            )
+        if cached is not None:
+            items, asin_map, vectors = cached
+            platform_data[pid] = {
+                "items": items,
+                "asin_map": asin_map,
+                "vectors": vectors,
+            }
+            cache_hits += 1
+        else:
+            pending_platform_entries.append((pid, pfile))
+            cache_misses += 1
+    pending_platform_map = dict(pending_platform_entries)
 
-    embedder_lock = threading.Lock()
+    platform_embedding_devices = parse_platform_embedding_devices(
+        embedding_device=embedding_device,
+        gpu_ids_text=args.platform_embedding_gpu_ids,
+    )
+    platform_assignments = assign_platforms_to_devices(
+        platform_ids=[pid for pid, _ in pending_platform_entries],
+        platform_files=[pfile for _, pfile in pending_platform_entries],
+        devices=platform_embedding_devices,
+    )
+    if pending_platform_entries:
+        print(
+            "Loading platform catalogs and building retrieval vectors "
+            f"for {len(pending_platform_entries)} cache-miss platform(s) across {len(platform_embedding_devices)} device(s)..."
+        )
+        for device in platform_embedding_devices:
+            assigned_pids = [pid for pid, _ in platform_assignments[device]]
+            print(f"{device}: assigned_platforms={assigned_pids}")
+
+        platform_embedders = {}
+        for device in platform_embedding_devices:
+            assigned_pids = [pid for pid, _ in platform_assignments[device]]
+            if not assigned_pids:
+                continue
+            print(f"{device}: loading embedding model replica for {assigned_pids} ...")
+            platform_embedders[device] = create_embedder(
+                embedding_model=args.embedding_model,
+                embedding_device=device,
+                embedding_local_only=bool(args.embedding_local_only),
+                embedding_max_seq_length=args.embedding_max_seq_length,
+                log_prefix=f"{device}: ",
+            )
+
+        try:
+            with ThreadPoolExecutor(max_workers=len(platform_embedders)) as executor:
+                future_to_device = {
+                    executor.submit(
+                        load_platform_items_group_worker,
+                        embedding_device=device,
+                        assigned_platforms=platform_assignments[device],
+                        embedder=platform_embedders[device],
+                        max_items=args.max_platform_items,
+                        embedding_batch_size=args.embedding_batch_size,
+                        embedding_show_progress=args.embedding_show_progress,
+                    ): device
+                    for device in platform_embedders
+                }
+                for future in as_completed(future_to_device):
+                    device = future_to_device[future]
+                    group_results = future.result()
+                    embedder_to_release = platform_embedders.pop(device, None)
+                    if embedder_to_release is not None:
+                        cleanup_embedder(embedder_to_release, device)
+                    for pid, result in group_results.items():
+                        items, asin_map, vectors = result
+                        if not items:
+                            raise RuntimeError(f"{pid} has no loaded items on {device}")
+                        platform_data[pid] = {
+                            "items": items,
+                            "asin_map": asin_map,
+                            "vectors": vectors,
+                        }
+                        if platform_cache_dir is not None:
+                            save_platform_cache(
+                                cache_dir=platform_cache_dir,
+                                platform_id=pid,
+                                platform_file=pending_platform_map[pid],
+                                items=items,
+                                vectors=vectors,
+                                max_items=args.max_platform_items,
+                                embedding_model=args.embedding_model,
+                                embedding_max_seq_length=args.embedding_max_seq_length,
+                            )
+                            print(f"{pid}: cache saved to {platform_cache_dir}")
+        finally:
+            for device, embedder_to_release in list(platform_embedders.items()):
+                cleanup_embedder(embedder_to_release, device)
+                platform_embedders.pop(device, None)
+    else:
+        print("All platform catalogs loaded from cache.")
+
+    if len(platform_data) != len(platform_ids):
+        missing = [pid for pid in platform_ids if pid not in platform_data]
+        raise RuntimeError(f"Failed to load platform data for: {missing}")
+
+    query_embedding_device = platform_embedding_devices[0] if platform_embedding_devices else embedding_device
+    print(f"Loading query embedding model: {args.embedding_model} (device={query_embedding_device})")
+    embedder = create_embedder(
+        embedding_model=args.embedding_model,
+        embedding_device=query_embedding_device,
+        embedding_local_only=bool(args.embedding_local_only),
+        embedding_max_seq_length=args.embedding_max_seq_length,
+    )
+
     platform_profiles = load_platform_profiles(profiles_path, platform_ids)
     # Persist initial empty profiles for reproducibility and explicit state tracking.
     persist_platform_profiles(profiles_path, platform_profiles)
@@ -939,7 +1458,6 @@ def run_simulation(args: argparse.Namespace) -> None:
                         platform_ids=platform_ids,
                         platform_data=platform_data,
                         embedder=embedder,
-                        embedder_lock=embedder_lock,
                     )
                     for entry_line_no, qrec in batch_entries
                 ]
@@ -982,27 +1500,17 @@ def run_simulation(args: argparse.Namespace) -> None:
                                 reward_pid = rank_list[first_target_rank - 1]
                                 penalty_pids = rank_list[: first_target_rank - 1]
 
-                                for pos, pid in enumerate(rank_list, start=1):
-                                    event_type = None
-                                    if pid in penalty_pids:
-                                        event_type = "penalty"
-                                    elif pid == reward_pid:
-                                        event_type = "reward"
-                                    if event_type is None:
-                                        continue
-
-                                    cand = candidate_map[pid]
-                                    mem = generate_reputation_memory(
-                                        client=client,
-                                        model=chat_model,
-                                        max_retries=args.max_retries,
-                                        event_type=event_type,
-                                        platform_id=pid,
-                                        user_query=prepared["user_query"],
-                                        item_title=cand.item.title,
-                                        rank_pos=pos,
-                                        target_rank=first_target_rank,
-                                    )
+                                for pid, mem in parallel_generate_reputation_memories(
+                                    api=api,
+                                    chat_model=chat_model,
+                                    max_retries=args.max_retries,
+                                    user_query=prepared["user_query"],
+                                    candidate_map=candidate_map,
+                                    rank_list=rank_list,
+                                    reward_pid=reward_pid,
+                                    penalty_pids=penalty_pids,
+                                    target_rank=first_target_rank,
+                                ):
                                     append_profile_memory(
                                         profiles=platform_profiles,
                                         platform_id=pid,
@@ -1059,6 +1567,11 @@ def run_simulation(args: argparse.Namespace) -> None:
         "max_platform_items": args.max_platform_items,
         "embedding_model": args.embedding_model,
         "embedding_device": args.embedding_device,
+        "platform_cache_dir": str(platform_cache_dir) if platform_cache_dir is not None else "",
+        "platform_cache_hits": cache_hits,
+        "platform_cache_misses": cache_misses,
+        "platform_embedding_devices": platform_embedding_devices,
+        "query_embedding_device": query_embedding_device,
         "embedding_batch_size": args.embedding_batch_size,
         "seed": args.seed,
     }
