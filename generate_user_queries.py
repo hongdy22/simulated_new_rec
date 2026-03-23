@@ -4,6 +4,8 @@ import hashlib
 import json
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -50,7 +52,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-users",
         type=int,
-        default=10,
+        default=20,
         help="Maximum number of users to process. 0 means all",
     )
     parser.add_argument(
@@ -76,6 +78,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.7,
         help="Sampling temperature",
+    )
+    parser.add_argument(
+        "--max-concurrency",
+        type=int,
+        default=10,
+        help="Maximum number of concurrent query generations",
     )
     return parser.parse_args()
 
@@ -179,17 +187,103 @@ def make_query_id(user_id: str, target: Dict) -> str:
     return hashlib.sha1(base.encode("utf-8")).hexdigest()
 
 
+def make_client(api: ApiConfig) -> OpenAI:
+    return OpenAI(base_url=api.base_url, api_key=api.api_key, timeout=api.timeout_seconds)
+
+
+def build_query_job(line_no: int, obj: Dict, max_history_items: int) -> Optional[Dict]:
+    user_id = obj.get("user_id")
+    interactions = obj.get("interactions", [])
+
+    if not user_id or len(interactions) < 2:
+        return None
+
+    history = interactions[:-1][-max_history_items:]
+    if not history:
+        return None
+
+    target = interactions[-1]
+    style = choose_style(user_id)
+    return {
+        "source_line": line_no,
+        "user_id": user_id,
+        "history": history,
+        "target": target,
+        "style": style,
+    }
+
+
+def generate_query_record(
+    job: Dict,
+    api: ApiConfig,
+    model: str,
+    temperature: float,
+    max_retries: int,
+    sleep_seconds: float,
+) -> Dict:
+    if sleep_seconds > 0:
+        time.sleep(sleep_seconds)
+
+    user_id = job["user_id"]
+    history = job["history"]
+    target = job["target"]
+    style = job["style"]
+    prompt = build_prompt(style=style, user_id=user_id, history=history, target=target)
+
+    try:
+        query = call_model(
+            client=make_client(api),
+            model=model,
+            prompt=prompt,
+            temperature=temperature,
+            max_retries=max_retries,
+        )
+    except Exception as err:
+        return {
+            "source_line": job["source_line"],
+            "user_id": user_id,
+            "status": "error",
+            "error": str(err),
+        }
+
+    return {
+        "query_id": make_query_id(user_id, target),
+        "source_line": job["source_line"],
+        "user_id": user_id,
+        "query_style": style,
+        "query_text": query,
+        "target_item": {
+            "parent_asin": target.get("parent_asin"),
+            "title": target.get("title"),
+            "timestamp": target.get("timestamp"),
+            "rating": target.get("rating"),
+            "text": target.get("text"),
+        },
+        "history_items": history,
+        "ua_query_packet": {
+            "query": query,
+            "style": style,
+            "user_id": user_id,
+            "target_parent_asin": target.get("parent_asin"),
+            "target_title": target.get("title"),
+            "target_timestamp": target.get("timestamp"),
+        },
+        "status": "ok",
+    }
+
+
 def generate_queries(args: argparse.Namespace) -> None:
     if not args.user_history_path.exists():
         raise FileNotFoundError(f"User history file not found: {args.user_history_path}")
     api = load_api_config()
     model = api.default_model
-    client = OpenAI(base_url=api.base_url, api_key=api.api_key, timeout=api.timeout_seconds)
 
     if args.max_history_items <= 0:
         raise ValueError("--max-history-items must be > 0")
     if args.start_line <= 0:
         raise ValueError("--start-line must be >= 1")
+    if args.max_concurrency <= 0:
+        raise ValueError("--max-concurrency must be > 0")
 
     args.output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -206,84 +300,57 @@ def generate_queries(args: argparse.Namespace) -> None:
     with args.user_history_path.open("r", encoding="utf-8") as src, args.output_path.open(
         "w", encoding="utf-8"
     ) as dst:
-        for line_no, line in enumerate(src, start=1):
-            if line_no < args.start_line:
-                continue
-            if args.max_users and processed >= args.max_users:
-                break
+        worker = partial(
+            generate_query_record,
+            api=api,
+            model=model,
+            temperature=args.temperature,
+            max_retries=args.max_retries,
+            sleep_seconds=args.sleep_seconds,
+        )
 
-            obj = json.loads(line)
-            user_id = obj.get("user_id")
-            interactions = obj.get("interactions", [])
+        line_no = 0
+        with ThreadPoolExecutor(max_workers=args.max_concurrency) as executor:
+            while True:
+                remaining_quota = args.max_concurrency
+                if args.max_users:
+                    remaining_quota = min(remaining_quota, args.max_users - processed)
+                    if remaining_quota <= 0:
+                        break
 
-            if not user_id or len(interactions) < 2:
-                skipped += 1
-                continue
+                batch_jobs: List[Dict] = []
+                while len(batch_jobs) < remaining_quota:
+                    line = src.readline()
+                    if not line:
+                        break
+                    line_no += 1
+                    if line_no < args.start_line:
+                        continue
 
-            history = interactions[:-1]
-            target = interactions[-1]
+                    job = build_query_job(
+                        line_no=line_no,
+                        obj=json.loads(line),
+                        max_history_items=args.max_history_items,
+                    )
+                    if job is None:
+                        skipped += 1
+                        continue
+                    batch_jobs.append(job)
 
-            history = history[-args.max_history_items :]
-            if not history:
-                skipped += 1
-                continue
+                if not batch_jobs:
+                    break
 
-            style = choose_style(user_id)
-            prompt = build_prompt(style=style, user_id=user_id, history=history, target=target)
-            try:
-                query = call_model(
-                    client=client,
-                    model=model,
-                    prompt=prompt,
-                    temperature=args.temperature,
-                    max_retries=args.max_retries,
-                )
-            except Exception as err:
-                errors += 1
-                result = {
-                    "source_line": line_no,
-                    "user_id": user_id,
-                    "status": "error",
-                    "error": str(err),
-                }
-                dst.write(json.dumps(result, ensure_ascii=False) + "\n")
-                continue
+                for result in executor.map(worker, batch_jobs):
+                    dst.write(json.dumps(result, ensure_ascii=False) + "\n")
+                    if result.get("status") == "ok":
+                        processed += 1
+                    else:
+                        errors += 1
 
-            query_record = {
-                "query_id": make_query_id(user_id, target),
-                "source_line": line_no,
-                "user_id": user_id,
-                "query_style": style,
-                "query_text": query,
-                "target_item": {
-                    "parent_asin": target.get("parent_asin"),
-                    "title": target.get("title"),
-                    "timestamp": target.get("timestamp"),
-                    "rating": target.get("rating"),
-                    "text": target.get("text"),
-                },
-                "history_items": history,
-                "ua_query_packet": {
-                    "query": query,
-                    "style": style,
-                    "user_id": user_id,
-                    "target_parent_asin": target.get("parent_asin"),
-                    "target_title": target.get("title"),
-                    "target_timestamp": target.get("timestamp"),
-                },
-                "status": "ok",
-            }
-            dst.write(json.dumps(query_record, ensure_ascii=False) + "\n")
-            processed += 1
-
-            # Single-line progress indicator.
-            sys.stderr.write(
-                f"\r[generate_user_queries] {processed}/{total_target} processed | skipped={skipped} errors={errors}"
-            )
-            sys.stderr.flush()
-
-            if args.sleep_seconds > 0:
-                time.sleep(args.sleep_seconds)
+                    sys.stderr.write(
+                        f"\r[generate_user_queries] {processed}/{total_target} processed | skipped={skipped} errors={errors}"
+                    )
+                    sys.stderr.flush()
 
     sys.stderr.write("\n")
     print(
