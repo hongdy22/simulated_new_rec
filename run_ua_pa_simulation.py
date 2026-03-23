@@ -65,19 +65,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--user-queries-path",
         type=Path,
-        default=Path("/home/threetu33/rec/output/user_queries.jsonl"),
+        default=Path("./output/user_queries.jsonl"),
         help="Path to generated user query JSONL",
     )
     parser.add_argument(
         "--platform-dir",
         type=Path,
-        default=Path("/home/threetu33/rec/output/platforms"),
+        default=Path("./output/platforms"),
         help="Directory containing platform_1.jsonl ... platform_5.jsonl",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("/home/threetu33/rec/output/sim"),
+        default=Path("./output/sim"),
         help="Output directory for simulation artifacts",
     )
     parser.add_argument(

@@ -34,13 +34,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--user-history-path",
         type=Path,
-        default=Path("/home/threetu33/rec/output/user_histories.jsonl"),
+        default=Path("./output/user_histories.jsonl"),
         help="Path to user history JSONL (one user per line)",
     )
     parser.add_argument(
         "--output-path",
         type=Path,
-        default=Path("/home/threetu33/rec/output/user_queries.jsonl"),
+        default=Path("./output/user_queries.jsonl"),
         help="Output JSONL path for generated query records",
     )
     parser.add_argument(
