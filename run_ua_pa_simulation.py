@@ -394,7 +394,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-queries",
         type=int,
-        default=2,
+        default=50,
         help="Maximum number of queries to run. 0 means all",
     )
     parser.add_argument(
@@ -956,50 +956,77 @@ def parallel_generate_platform_candidates(
         return [future.result() for future in futures]
 
 
-def parallel_generate_reputation_memories(
-    api: ApiConfig,
-    chat_model: str,
+def build_target_item_payload(target_item: Dict) -> Dict:
+    return {
+        "parent_asin": str(target_item.get("parent_asin") or ""),
+        "title": clean_text(target_item.get("title"), 300),
+        "rating": target_item.get("rating"),
+        "user_review": clean_text(target_item.get("text"), 280),
+    }
+
+
+def generate_purchase_reputation_memory(
+    client: OpenAI,
+    model: str,
     max_retries: int,
     user_query: str,
-    candidate_map: Dict[str, PlatformCandidate],
-    rank_list: List[str],
-    reward_pid: str,
-    penalty_pids: List[str],
-    target_rank: int,
-) -> List[Tuple[str, str]]:
-    event_specs: List[Tuple[str, str, str, int]] = []
-    for pos, pid in enumerate(rank_list, start=1):
-        event_type = None
-        if pid in penalty_pids:
-            event_type = "penalty"
-        elif pid == reward_pid:
-            event_type = "reward"
-        if event_type is None:
-            continue
-        event_specs.append((pid, event_type, candidate_map[pid].item.title, pos))
+    target_item: Dict,
+    purchased_candidate: PlatformCandidate,
+) -> str:
+    target_payload = build_target_item_payload(target_item)
+    purchased_item_payload = purchased_candidate.item.to_pitch_payload()
+    prompt = f"""
+You are updating a platform reputation memory after a simulated purchase.
+Write ONE or TWO short English sentences (total <= 55 words) that will help future ranking.
 
-    if not event_specs:
-        return []
+The user saw the platform pitch before buying, then experienced the item's real information after purchase.
+Compare both against what the user likely wanted, represented by the real next item.
 
-    with ThreadPoolExecutor(max_workers=max(1, len(event_specs))) as executor:
-        futures = [
-            executor.submit(
-                generate_reputation_memory,
-                client=make_client(api),
-                model=chat_model,
+User query:
+{user_query}
+
+Real next item the user actually wanted:
+{json.dumps(target_payload, ensure_ascii=False)}
+
+Purchased item real information:
+{json.dumps(purchased_item_payload, ensure_ascii=False)}
+
+Platform pitch shown before purchase:
+{purchased_candidate.pitch}
+
+Rules:
+- Judge whether the platform pitch or the purchased item's real information is closer to the user's intended item.
+- The memory may be positive, negative, or mixed depending on the evidence.
+- If alignment is strong, write a positive trust signal only.
+- Only mention a mismatch risk when there is a concrete unsupported claim, incompatibility, or intent mismatch.
+- If evidence is mixed, you may mention both one trust signal and one risk.
+- Prefer specific factual observations over generic cautionary language.
+- Do not invent specs, reviews, or guarantees.
+- Output plain text only.
+""".strip()
+    try:
+        return clean_text(
+            llm_chat_json(
+                client=client,
+                model=model,
+                system_prompt="You create concise post-purchase platform reputation memories.",
+                user_prompt=prompt,
                 max_retries=max_retries,
-                event_type=event_type,
-                platform_id=pid,
-                user_query=user_query,
-                item_title=item_title,
-                rank_pos=pos,
-                target_rank=target_rank,
+            ),
+            320,
+        )
+    except Exception:
+        target_title = clean_text(target_item.get("title"), 120) or "the intended item"
+        purchased_title = clean_text(purchased_candidate.item.title, 120) or "the purchased item"
+        if target_title.lower() != purchased_title.lower():
+            return (
+                f"The top-ranked pitch led the user toward {purchased_title} instead of {target_title}. "
+                "Post-purchase details suggest possible intent mismatch risk."
             )
-            for pid, event_type, item_title, pos in event_specs
-        ]
-        memories = [future.result() for future in futures]
-
-    return [(pid, mem) for (pid, _, _, _), mem in zip(event_specs, memories)]
+        return (
+            "The top-ranked pitch stayed close to the user's likely need. "
+            "Post-purchase details look broadly consistent, so this platform seems reasonably trustworthy."
+        )
 
 
 def prepare_round(
@@ -1023,7 +1050,9 @@ def prepare_round(
         "query_id": query_id,
         "source_line": line_no,
         "user_id": qrec.get("user_id"),
+        "query_text": user_query,
         "target_asin": target_asin,
+        "target_item": build_target_item_payload(target_item),
         "status": "started",
     }
 
@@ -1048,24 +1077,8 @@ def prepare_round(
                 intended_exists_any = True
                 if hit_rng.random() < intended_hit_prob:
                     intended_hit_pids.append(pid)
-
-        if not intended_exists_any:
-            round_obj.update(
-                {
-                    "status": "skipped_no_intended",
-                    "intended_hit_platform_ids": [],
-                }
-            )
-            return {"round_obj": round_obj}
-
-        if not intended_hit_pids:
-            round_obj.update(
-                {
-                    "status": "skipped_intended_not_hit",
-                    "intended_hit_platform_ids": [],
-                }
-            )
-            return {"round_obj": round_obj}
+        round_obj["intended_item_exists_in_any_platform"] = intended_exists_any
+        round_obj["intended_hit_platform_ids"] = intended_hit_pids
 
         qvec = encode_query_vector(ua_struct, embedder)
         candidates = parallel_generate_platform_candidates(
@@ -1085,19 +1098,12 @@ def prepare_round(
             for candidate in candidates
             if candidate.item.parent_asin == target_asin
         ]
-        if not intended_platforms:
-            round_obj.update(
-                {
-                    "status": "skipped_no_intended",
-                    "platform_candidates": [serialize_candidate(c) for c in candidates],
-                }
-            )
-            return {"round_obj": round_obj}
 
         return {
             "round_obj": round_obj,
             "user_query": user_query,
             "target_asin": target_asin,
+            "target_item": target_item,
             "candidates": candidates,
             "intended_platform_ids": intended_platforms,
         }
@@ -1168,46 +1174,6 @@ ranked_platform_ids must include all platforms exactly once.
         rationale = str(obj.get("rationale") or "")
 
     return rank, rationale
-
-
-def generate_reputation_memory(
-    client: OpenAI,
-    model: str,
-    max_retries: int,
-    event_type: str,
-    platform_id: str,
-    user_query: str,
-    item_title: str,
-    rank_pos: int,
-    target_rank: int,
-) -> str:
-    prompt = f"""
-You are a platform reputation logger. Write ONE short English memory note (one sentence, <= 28 words).
-It should be specific enough to help future ranking, but avoid claiming certainty beyond the evidence.
-
-event_type={event_type}
-platform_id={platform_id}
-user_query={user_query}
-recommended_item_title={item_title}
-rank_pos={rank_pos}
-target_rank={target_rank}
-
-Rules:
-- penalty: mention it was ranked ahead of the target but missed the intended match; add ONE plausible mismatch hint (e.g., wrong type, missing compatibility, budget mismatch), phrased as "may".
-- reward: mention it matched the intended need; add ONE concrete helpful aspect aligned with the query (e.g., compatibility, use-case fit), without inventing specs.
-""".strip()
-    try:
-        return llm_chat_json(
-            client=client,
-            model=model,
-            system_prompt="You create concise reputation memory notes.",
-            user_prompt=prompt,
-            max_retries=max_retries,
-        )
-    except Exception:
-        if event_type == "penalty":
-            return "Ranked high but missed the true target, showing possible over-marketing risk."
-        return "Matched the true need; recommendation appears trustworthy."
 
 
 def append_profile_memory(
@@ -1408,6 +1374,9 @@ def run_simulation(args: argparse.Namespace) -> None:
     skipped_no_intended = 0
     skipped_intended_not_hit = 0
     error_rounds = 0
+    settled_rounds = 0
+    target_missing_after_ranking = 0
+    profile_updates_written = 0
 
     # Best-effort total for progress display (counts raw lines, not necessarily status=ok).
     with args.user_queries_path.open("r", encoding="utf-8") as f:
@@ -1487,59 +1456,63 @@ def run_simulation(args: argparse.Namespace) -> None:
                                 ),
                                 None,
                             )
+                            purchased_pid = rank_list[0]
+                            purchased_candidate = candidate_map[purchased_pid]
+                            reputation_memory = generate_purchase_reputation_memory(
+                                client=client,
+                                model=chat_model,
+                                max_retries=args.max_retries,
+                                user_query=prepared["user_query"],
+                                target_item=prepared["target_item"],
+                                purchased_candidate=purchased_candidate,
+                            )
+                            append_profile_memory(
+                                profiles=platform_profiles,
+                                platform_id=purchased_pid,
+                                entry=reputation_memory,
+                                window_size=args.profile_window_size,
+                            )
 
-                            if first_target_rank is None:
-                                round_obj.update(
-                                    {
-                                        "status": "skipped_after_ranking_no_intended",
-                                        "ua_rank_list": rank_list,
-                                        "ua_rationale": rationale,
-                                    }
-                                )
-                            else:
-                                reward_pid = rank_list[first_target_rank - 1]
-                                penalty_pids = rank_list[: first_target_rank - 1]
-
-                                for pid, mem in parallel_generate_reputation_memories(
-                                    api=api,
-                                    chat_model=chat_model,
-                                    max_retries=args.max_retries,
-                                    user_query=prepared["user_query"],
-                                    candidate_map=candidate_map,
-                                    rank_list=rank_list,
-                                    reward_pid=reward_pid,
-                                    penalty_pids=penalty_pids,
-                                    target_rank=first_target_rank,
-                                ):
-                                    append_profile_memory(
-                                        profiles=platform_profiles,
-                                        platform_id=pid,
-                                        entry=mem,
-                                        window_size=args.profile_window_size,
-                                    )
-
-                                round_obj.update(
-                                    {
-                                        "status": "settled",
-                                        "platform_candidates": [
-                                            serialize_candidate(candidate) for candidate in candidates
-                                        ],
-                                        "intended_platform_ids": prepared["intended_platform_ids"],
-                                        "ua_rank_list": rank_list,
-                                        "ua_rationale": rationale,
-                                        "target_rank": first_target_rank,
-                                        "reward_platform": reward_pid,
-                                        "penalty_platforms": penalty_pids,
-                                    }
-                                )
+                            round_obj.update(
+                                {
+                                    "status": "settled",
+                                    "platform_candidates": [
+                                        serialize_candidate(candidate) for candidate in candidates
+                                    ],
+                                    "intended_platform_ids": prepared["intended_platform_ids"],
+                                    "ua_rank_list": rank_list,
+                                    "ua_rationale": rationale,
+                                    "target_rank": first_target_rank,
+                                    "reward_platform": purchased_pid,
+                                    "purchased_platform": purchased_pid,
+                                    "purchased_item": purchased_candidate.item.to_pitch_payload(),
+                                    "purchased_pitch": purchased_candidate.pitch,
+                                    "purchased_pitch_style": purchased_candidate.pitch_style,
+                                    "penalty_platforms": [],
+                                    "profile_memory_update": reputation_memory,
+                                }
+                            )
                         except Exception as err:
                             round_obj.update({"status": "error", "error": str(err)})
 
                     status = round_obj.get("status")
-                    if status in {"skipped_no_intended", "skipped_after_ranking_no_intended"}:
+                    if status == "skipped_no_intended":
                         skipped_no_intended += 1
                     elif status == "skipped_intended_not_hit":
                         skipped_intended_not_hit += 1
+                    elif status == "settled":
+                        settled_rounds += 1
+                        target_rank_raw = round_obj.get("target_rank")
+                        target_rank = (
+                            int(target_rank_raw)
+                            if isinstance(target_rank_raw, int)
+                            or str(target_rank_raw or "").isdigit()
+                            else 0
+                        )
+                        if target_rank <= 0:
+                            target_missing_after_ranking += 1
+                        if str(round_obj.get("profile_memory_update") or "").strip():
+                            profile_updates_written += 1
                     elif status == "error":
                         error_rounds += 1
 
@@ -1547,7 +1520,7 @@ def run_simulation(args: argparse.Namespace) -> None:
                     processed += 1
                     persist_platform_profiles(profiles_path, platform_profiles)
                     sys.stderr.write(
-                        f"\r[run_ua_pa_simulation] {processed}/{total_target} simulated | skipped_no_intended={skipped_no_intended} skipped_intended_not_hit={skipped_intended_not_hit} error_rounds={error_rounds}"
+                        f"\r[run_ua_pa_simulation] {processed}/{total_target} simulated | settled={settled_rounds} target_missing_after_ranking={target_missing_after_ranking} profile_updates={profile_updates_written} error_rounds={error_rounds}"
                     )
                     sys.stderr.flush()
 
@@ -1558,8 +1531,11 @@ def run_simulation(args: argparse.Namespace) -> None:
         "rounds_path": str(rounds_path),
         "profiles_path": str(profiles_path),
         "processed_rounds": processed,
+        "settled_rounds": settled_rounds,
         "skipped_no_intended": skipped_no_intended,
         "skipped_intended_not_hit": skipped_intended_not_hit,
+        "target_missing_after_ranking": target_missing_after_ranking,
+        "profile_updates_written": profile_updates_written,
         "error_rounds": error_rounds,
         "chat_model": chat_model,
         "intended_hit_prob": args.intended_hit_prob,

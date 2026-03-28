@@ -17,13 +17,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--meta-path",
         type=Path,
-        default=Path("/mnt/d/桌面/new_rec/dataset/meta_Musical_Instruments.jsonl"),
+        default=Path("./dataset/meta_Musical_Instruments.jsonl"),
         help="Path to meta_Musical_Instruments.jsonl",
     )
     parser.add_argument(
         "--review-path",
         type=Path,
-        default=Path("/mnt/d/桌面/new_rec/dataset/Musical_Instruments.jsonl"),
+        default=Path("./dataset/Musical_Instruments.jsonl"),
         help="Path to Musical_Instruments.jsonl",
     )
     parser.add_argument(

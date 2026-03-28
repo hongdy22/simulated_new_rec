@@ -52,7 +52,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-users",
         type=int,
-        default=20,
+        default=50,
         help="Maximum number of users to process. 0 means all",
     )
     parser.add_argument(
