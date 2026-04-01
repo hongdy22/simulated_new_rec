@@ -10,11 +10,11 @@ from typing import Dict, Iterable, List, Tuple
 
 PLATFORM_IDS = ["P1", "P2", "P3", "P4", "P5"]
 PLATFORM_PERSONALITIES = {
-    "P1": "honest",
+    "P1": "concise",
     "P2": "expert",
-    "P3": "concise",
-    "P4": "friendly",
-    "P5": "promo",
+    "P3": "honest",
+    "P4": "promo",
+    "P5": "friendly",
 }
 DEFAULT_ROUNDS_PATH = Path(__file__).resolve().parent / "output" / "sim" / "simulation_rounds.jsonl"
 

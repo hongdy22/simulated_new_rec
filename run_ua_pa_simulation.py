@@ -406,7 +406,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--intended-hit-prob",
         type=float,
-        default=0.9,
+        default=0.1,
         help="If intended item exists in platform catalog, chance to force-hit it",
     )
     parser.add_argument(
@@ -611,11 +611,11 @@ def parse_rank_list(text: str, valid_ids: List[str]) -> Optional[List[str]]:
 
 def choose_pitch_style(platform_id: str) -> str:
     platform_style_map = {
-        "P1": "honest",
+        "P1": "concise",
         "P2": "expert",
-        "P3": "concise",
-        "P4": "friendly",
-        "P5": "promo",
+        "P3": "honest",
+        "P4": "promo",
+        "P5": "friendly",
     }
     style = platform_style_map.get(platform_id)
     if style in PITCH_STYLE_GUIDES:
@@ -1207,6 +1207,8 @@ def persist_platform_profiles(path: Path, profiles: Dict[str, List[str]]) -> Non
 
 
 def run_simulation(args: argparse.Namespace) -> None:
+    started_at = time.perf_counter()
+
     if args.start_line <= 0:
         raise ValueError("--start-line must be >= 1")
     if args.max_queries < 0:
@@ -1525,6 +1527,7 @@ def run_simulation(args: argparse.Namespace) -> None:
                     sys.stderr.flush()
 
     sys.stderr.write("\n")
+    elapsed_seconds = time.perf_counter() - started_at
     summary = {
         "user_queries_path": str(args.user_queries_path),
         "platform_dir": str(args.platform_dir),
@@ -1550,8 +1553,10 @@ def run_simulation(args: argparse.Namespace) -> None:
         "query_embedding_device": query_embedding_device,
         "embedding_batch_size": args.embedding_batch_size,
         "seed": args.seed,
+        "elapsed_seconds": elapsed_seconds,
     }
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"[run_ua_pa_simulation] elapsed_seconds={elapsed_seconds:.2f}")
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 
 
