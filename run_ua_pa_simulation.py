@@ -486,6 +486,18 @@ def parse_args() -> argparse.Namespace:
         default=10,
         help="Maximum number of queries to prepare concurrently",
     )
+    parser.add_argument(
+        "--retrieval-top-k",
+        type=int,
+        default=10,
+        help="Retrieve top-K items per platform before sampling one with Gumbel-Max",
+    )
+    parser.add_argument(
+        "--gumbel-temperature",
+        type=float,
+        default=0.1,
+        help="Temperature for Gumbel-Max retrieval sampling; lower means closer to greedy top-1",
+    )
     return parser.parse_args()
 
 
@@ -855,20 +867,47 @@ def encode_query_vector(ua_structured: Dict, embedder):
     return np.asarray(qvec, dtype=np.float32).reshape(-1)
 
 
-def retrieve_top1(
+def sample_gumbel_noise(rng: random.Random) -> float:
+    u = min(max(rng.random(), 1e-12), 1.0 - 1e-12)
+    return -math.log(-math.log(u))
+
+
+def retrieve_topk_gumbel(
     items: List[Item],
     vectors,
     qvec,
+    top_k: int,
+    gumbel_temperature: float,
+    rng: random.Random,
 ) -> Tuple[Item, float]:
+    import numpy as np
+
     if not items:
         raise ValueError("Platform has no items loaded")
     if vectors is None or getattr(vectors, "shape", (0,))[0] == 0:
         raise ValueError("Platform has no embedding vectors loaded")
 
     scores = vectors @ qvec
-    best_idx = int(scores.argmax())
-    best_score = float(scores[best_idx])
-    return items[best_idx], best_score
+    candidate_count = min(max(1, int(top_k)), len(items))
+    if candidate_count == 1:
+        best_idx = int(scores.argmax())
+        return items[best_idx], float(scores[best_idx])
+
+    score_count = int(scores.shape[0])
+    if candidate_count >= score_count:
+        top_idx = np.argsort(scores)[::-1]
+    else:
+        partition_idx = score_count - candidate_count
+        top_idx_unsorted = np.argpartition(scores, partition_idx)[partition_idx:]
+        top_idx = top_idx_unsorted[np.argsort(scores[top_idx_unsorted])[::-1]]
+    scaled_scores = scores[top_idx] / float(gumbel_temperature)
+    noisy_scores = np.asarray(
+        [float(score) + sample_gumbel_noise(rng) for score in scaled_scores],
+        dtype=np.float32,
+    )
+    chosen_pos = int(noisy_scores.argmax())
+    chosen_idx = int(top_idx[chosen_pos])
+    return items[chosen_idx], float(scores[chosen_idx])
 
 
 def generate_platform_pitch(
@@ -940,6 +979,9 @@ def build_platform_candidate(
     intended_hit_pids: List[str],
     platform_data: Dict[str, Dict],
     qvec,
+    retrieval_top_k: int,
+    gumbel_temperature: float,
+    retrieval_rng: random.Random,
 ) -> PlatformCandidate:
     pdata = platform_data[pid]
     asin_map: Dict[str, Item] = pdata["asin_map"]
@@ -952,7 +994,14 @@ def build_platform_candidate(
         score = 1.0
         forced_hit = True
     else:
-        chosen, score = retrieve_top1(items=items, vectors=vectors, qvec=qvec)
+        chosen, score = retrieve_topk_gumbel(
+            items=items,
+            vectors=vectors,
+            qvec=qvec,
+            top_k=retrieval_top_k,
+            gumbel_temperature=gumbel_temperature,
+            rng=retrieval_rng,
+        )
 
     style = choose_pitch_style(pid)
     pitch = generate_platform_pitch(
@@ -984,6 +1033,10 @@ def parallel_generate_platform_candidates(
     intended_hit_pids: List[str],
     platform_data: Dict[str, Dict],
     qvec,
+    seed: int,
+    query_id: str,
+    retrieval_top_k: int,
+    gumbel_temperature: float,
 ) -> List[PlatformCandidate]:
     with ThreadPoolExecutor(max_workers=max(1, len(platform_ids))) as executor:
         futures = [
@@ -998,6 +1051,9 @@ def parallel_generate_platform_candidates(
                 intended_hit_pids,
                 platform_data,
                 qvec,
+                retrieval_top_k,
+                gumbel_temperature,
+                make_stable_rng(seed, query_id, pid, "retrieval_gumbel"),
             )
             for pid in platform_ids
         ]
@@ -1089,6 +1145,8 @@ def prepare_round(
     platform_ids: List[str],
     platform_data: Dict[str, Dict],
     embedder,
+    retrieval_top_k: int,
+    gumbel_temperature: float,
 ) -> Dict:
     user_query = str(qrec.get("query_text") or "")
     target_item = qrec.get("target_item") or {}
@@ -1139,6 +1197,10 @@ def prepare_round(
             intended_hit_pids=intended_hit_pids,
             platform_data=platform_data,
             qvec=qvec,
+            seed=seed,
+            query_id=query_id,
+            retrieval_top_k=retrieval_top_k,
+            gumbel_temperature=gumbel_temperature,
         )
 
         intended_platforms = [
@@ -1269,6 +1331,10 @@ def run_simulation(args: argparse.Namespace) -> None:
         raise ValueError("--embedding-batch-size must be > 0")
     if args.max_concurrency <= 0:
         raise ValueError("--max-concurrency must be > 0")
+    if args.retrieval_top_k <= 0:
+        raise ValueError("--retrieval-top-k must be > 0")
+    if args.gumbel_temperature <= 0:
+        raise ValueError("--gumbel-temperature must be > 0")
 
     platform_files = sorted(args.platform_dir.glob("platform_*.jsonl"))
     if len(platform_files) != 5:
@@ -1477,6 +1543,8 @@ def run_simulation(args: argparse.Namespace) -> None:
                         platform_ids=platform_ids,
                         platform_data=platform_data,
                         embedder=embedder,
+                        retrieval_top_k=args.retrieval_top_k,
+                        gumbel_temperature=args.gumbel_temperature,
                     )
                     for entry_line_no, qrec in batch_entries
                 ]
@@ -1600,6 +1668,8 @@ def run_simulation(args: argparse.Namespace) -> None:
         "platform_embedding_devices": platform_embedding_devices,
         "query_embedding_device": query_embedding_device,
         "embedding_batch_size": args.embedding_batch_size,
+        "retrieval_top_k": args.retrieval_top_k,
+        "gumbel_temperature": args.gumbel_temperature,
         "seed": args.seed,
         "elapsed_seconds": elapsed_seconds,
     }
