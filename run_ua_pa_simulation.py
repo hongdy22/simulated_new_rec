@@ -512,6 +512,45 @@ def tokenize(text: str) -> List[str]:
     return re.findall(r"[a-zA-Z0-9]+", text.lower())
 
 
+def format_history_for_ua(history_items: Sequence[Dict]) -> str:
+    if not history_items:
+        return "None"
+
+    lines: List[str] = []
+    for idx, item in enumerate(history_items, start=1):
+        parts = [f"title={clean_text(item.get('title'), 120) or 'Unknown title'}"]
+        rating = item.get("rating")
+        timestamp = item.get("timestamp")
+        review = clean_text(item.get("text"), 180)
+        if rating is not None:
+            parts.append(f"rating={rating}")
+        if timestamp:
+            parts.append(f"timestamp={timestamp}")
+        if review:
+            parts.append(f"review={review}")
+        lines.append(f"{idx}. " + " | ".join(parts))
+    return "\n".join(lines)
+
+
+def fallback_long_term_need(history_items: Sequence[Dict], query: str) -> str:
+    titles = [
+        clean_text(item.get("title"), 80)
+        for item in history_items[-3:]
+        if clean_text(item.get("title"), 80)
+    ]
+    if titles:
+        return clean_text("Long-term interest around " + "; ".join(titles), 180)
+    return clean_text(query, 180)
+
+
+def ua_long_term_need(ua_structured: Dict) -> str:
+    return clean_text(str(ua_structured.get("long_term_need") or ""), 180)
+
+
+def ua_current_need(ua_structured: Dict) -> str:
+    return clean_text(str(ua_structured.get("current_need") or ""), 180)
+
+
 def hash_embedding(text: str, dim: int) -> List[float]:
     vec = [0.0] * dim
     tokens = tokenize(text)
@@ -738,62 +777,71 @@ def ua_structure_query(
 ) -> Dict:
     query = query_record.get("query_text", "")
     style = query_record.get("query_style", "")
+    history_items = query_record.get("history_items") or []
 
     user_prompt = f"""
-Convert the following user query into a structured JSON object for downstream retrieval.
+Convert the following user query into a compact JSON object for downstream retrieval.
+Use the user's past history to infer longer-term preference, while keeping the
+current intent tightly grounded in the current query.
 Output JSON only (no markdown, no extra keys).
 
 Schema (types + limits):
-- user_need: string (<= 25 words)
-- query_rewrite: string (<= 25 words). Keep meaning; do NOT add new brands/models/specs not implied by the query.
-- keywords: array of 3-8 short keyword phrases (nouns or noun-phrases). Avoid adjectives-only.
-- constraints: array of 0-5 short constraints .
+- long_term_need: string (<= 30 words). Reflect the user's broader, more stable need or preference pattern, inferred mainly from history.
+- current_need: string (<= 25 words). Rewrite the current query for retrieval. Keep meaning; do NOT add new brands/models/specs not implied by the query.
+
+Rules:
+- long_term_need should mainly come from history rather than simply paraphrasing the current query, unless history is empty or uninformative.
+- current_need should stay close to the current query and capture the user's immediate task.
 
 Example output:
 {{
-  "user_need": "A beginner-friendly electric guitar bundle for home practice",
-  "query_rewrite": "beginner electric guitar starter kit for home practice",
-  "keywords": ["electric guitar", "starter kit", "beginner", "home practice"],
-  "constraints": ["easy to set up", "includes essentials", "quiet practice option"]
+  "long_term_need": "Beginner-friendly home music gear with low setup burden",
+  "current_need": "beginner electric guitar starter kit for home practice"
 }}
 
-Input:
+User history:
+{format_history_for_ua(history_items)}
+
+Current query:
 query_text={query}
 """.strip()
 
     system = "You are a strict JSON generator for recommendation query understanding."
 
+    fallback = {
+        "long_term_need": fallback_long_term_need(history_items, query),
+        "current_need": clean_text(str(query), 180),
+        "style": style,
+    }
+
     try:
         raw = llm_chat_json(client, model, system, user_prompt, max_retries)
         obj = parse_json_object(raw)
         if obj:
-            obj.setdefault("style", style)
-            obj.setdefault("query_rewrite", query)
-            obj.setdefault("keywords", tokenize(query)[:6])
-            obj.setdefault("constraints", [])
-            obj.setdefault("user_need", query)
-            return obj
+            return {
+                "long_term_need": clean_text(
+                    str(obj.get("long_term_need") or fallback["long_term_need"]),
+                    180,
+                ),
+                "current_need": clean_text(
+                    str(obj.get("current_need") or fallback["current_need"]),
+                    180,
+                ),
+                "style": style,
+            }
     except Exception:
         pass
 
-    return {
-        "user_need": query,
-        "query_rewrite": query,
-        "keywords": tokenize(query)[:6],
-        "constraints": [],
-        "style": style,
-    }
+    return fallback
 
 
 def build_query_embedding_text(ua_structured: Dict) -> str:
-    return " ".join(
-        [
-            str(ua_structured.get("query_rewrite") or ""),
-            " ".join(str(x) for x in (ua_structured.get("keywords") or [])),
-            " ".join(str(x) for x in (ua_structured.get("constraints") or [])),
-            str(ua_structured.get("user_need") or ""),
-        ]
-    )
+    current_need = ua_current_need(ua_structured)
+    long_term_need = ua_long_term_need(ua_structured)
+    parts = [current_need]
+    if long_term_need and long_term_need != current_need:
+        parts.append(long_term_need)
+    return " ".join(parts)
 
 
 def encode_query_vector(ua_structured: Dict, embedder):
@@ -839,7 +887,7 @@ def generate_platform_pitch(
 
     prompt = f"""
 You are the bidding agent for platform {platform_id}. Write a concise product pitch
-for the candidate item based on the user's structured needs.
+for the candidate item based on the user's long-term preference and current intent.
 
 Pitch style: {pitch_style}
 Style guidance: {style_instruction}
@@ -850,7 +898,7 @@ Requirements:
 - Tie the message to user needs and usage scenario
 - Return plain text only
 
-User need structure:
+User preference and current intent:
 {json.dumps(ua_structured, ensure_ascii=False)}
 
 Candidate item data:

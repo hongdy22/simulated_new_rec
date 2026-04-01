@@ -420,7 +420,14 @@ def render_case_pages(rounds: List[Dict]) -> Tuple[str, str, str]:
         status = str(round_obj.get("status") or "unknown")
         style = style_of(round_obj)
         ua = round_obj.get("ua_structured_query") or {}
-        query_text = round_obj.get("query_text") or ua.get("query_rewrite") or ua.get("user_need") or ""
+        query_text = (
+            round_obj.get("query_text")
+            or ua.get("current_need")
+            or ua.get("long_term_need")
+            or ""
+        )
+        long_term_need = ua.get("long_term_need") or "N/A"
+        current_need = ua.get("current_need") or query_text or "N/A"
         target_item = round_obj.get("target_item") or {}
         intended_pids = [str(pid) for pid in (round_obj.get("intended_platform_ids") or [])]
         penalty_pids = [str(pid) for pid in (round_obj.get("penalty_platforms") or [])]
@@ -468,10 +475,8 @@ def render_case_pages(rounds: List[Dict]) -> Tuple[str, str, str]:
             "<section>"
             "<h3>Query</h3>"
             f"<p><strong>Original Query:</strong> {esc(query_text or 'N/A')}</p>"
-            f"<p><strong>User Need:</strong> {esc(ua.get('user_need') or 'N/A')}</p>"
-            f"<p><strong>Query Rewrite:</strong> {esc(ua.get('query_rewrite') or query_text or 'N/A')}</p>"
-            f"<p><strong>Keywords:</strong> {chip_list(ua.get('keywords') or [])}</p>"
-            f"<p><strong>Constraints:</strong> {chip_list(ua.get('constraints') or [])}</p>"
+            f"<p><strong>Long-Term Need:</strong> {esc(long_term_need)}</p>"
+            f"<p><strong>Current Need:</strong> {esc(current_need)}</p>"
             f"<p><strong>Real Next Item:</strong> {esc(target_item.get('title') or 'N/A')}</p>"
             f"<p><strong>Real Next Review:</strong> {esc(short_text(target_item.get('user_review') or '', 200) or 'N/A')}</p>"
             "</section>"
