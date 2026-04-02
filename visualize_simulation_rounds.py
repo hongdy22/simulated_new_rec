@@ -2,6 +2,7 @@
 import argparse
 import html
 import json
+import math
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,8 +14,16 @@ PLATFORM_PERSONALITIES = {
     "P1": "concise",
     "P2": "expert",
     "P3": "honest",
-    "P4": "promo",
-    "P5": "friendly",
+    "P4": "exaggerated",
+    "P5": "auto",
+}
+SERIES_COLORS = {
+    "P1": "#2f6fed",
+    "P2": "#d96f32",
+    "P3": "#2d8a5f",
+    "P4": "#bf3d3d",
+    "P5": "#7a5c2e",
+    "NO_PURCHASE": "#6f7787",
 }
 DEFAULT_ROUNDS_PATH = Path(__file__).resolve().parent / "output" / "sim" / "simulation_rounds.jsonl"
 
@@ -116,6 +125,7 @@ def compute_metrics(rounds: List[Dict]) -> Dict:
     total_rounds = len(rounds)
     settled_rounds = [r for r in rounds if r.get("status") == "settled"]
     error_rounds = [r for r in rounds if r.get("status") == "error"]
+    settled_count = len(settled_rounds)
 
     target_rank_values = [
         int(r.get("target_rank"))
@@ -125,6 +135,7 @@ def compute_metrics(rounds: List[Dict]) -> Dict:
     top1_hits = sum(1 for r in settled_rounds if int(r.get("target_rank") or 0) == 1)
     target_rank_missing_count = 0
     profile_update_count = 0
+    no_purchase_count = 0
 
     style_totals: Counter = Counter()
     purchase_by_style_platform: Dict[str, Counter] = defaultdict(Counter)
@@ -189,8 +200,11 @@ def compute_metrics(rounds: List[Dict]) -> Dict:
         if target_rank <= 0:
             target_rank_missing_count += 1
 
+        is_no_purchase = bool(round_obj.get("no_purchase"))
         purchased_platform = purchased_platform_of(round_obj)
-        if purchased_platform:
+        if is_no_purchase or not purchased_platform:
+            no_purchase_count += 1
+        elif purchased_platform:
             purchase_by_style_platform[style][purchased_platform] += 1
             if purchased_platform in platform_metrics:
                 platform_metrics[purchased_platform]["purchase_count"] += 1
@@ -208,7 +222,6 @@ def compute_metrics(rounds: List[Dict]) -> Dict:
                 platform_metrics[pid]["intended_presence_count"] += 1
 
     platform_rows: List[Dict] = []
-    settled_count = len(settled_rounds)
     for pid in PLATFORM_IDS:
         metrics = platform_metrics[pid]
         platform_rows.append(
@@ -232,22 +245,51 @@ def compute_metrics(rounds: List[Dict]) -> Dict:
         purchase_style_matrix.append(row)
 
     target_rank_counts = Counter(target_rank_values)
+    settled_round_index = list(range(1, settled_count + 1))
+    purchase_events: List[str] = []
+    for round_obj in settled_rounds:
+        purchased_platform = purchased_platform_of(round_obj)
+        if bool(round_obj.get("no_purchase")) or not purchased_platform:
+            purchase_events.append("NO_PURCHASE")
+        else:
+            purchase_events.append(purchased_platform)
+
+    trend_window = 0
+    recent_purchase_count_series = {pid: [] for pid in PLATFORM_IDS}
+    recent_no_purchase_rate_series: List[float] = []
+    if settled_count:
+        trend_window = min(settled_count, max(8, min(40, max(1, settled_count // 6))))
+        for idx in range(settled_count):
+            start = max(0, idx - trend_window + 1)
+            window_events = purchase_events[start : idx + 1]
+            counts = Counter(window_events)
+            for pid in PLATFORM_IDS:
+                recent_purchase_count_series[pid].append(float(counts.get(pid, 0)))
+            recent_no_purchase_rate_series.append(
+                safe_pct(counts.get("NO_PURCHASE", 0), len(window_events))
+            )
 
     return {
         "total_rounds": total_rounds,
-        "settled_count": len(settled_rounds),
+        "settled_count": settled_count,
         "error_count": len(error_rounds),
         "top1_hits": top1_hits,
-        "top1_rate_on_settled": safe_pct(top1_hits, len(settled_rounds)),
+        "top1_rate_on_settled": safe_pct(top1_hits, settled_count),
         "avg_target_rank": avg(target_rank_values),
         "target_rank_missing_count": target_rank_missing_count,
         "profile_update_count": profile_update_count,
+        "no_purchase_count": no_purchase_count,
+        "no_purchase_rate_on_settled": safe_pct(no_purchase_count, settled_count),
         "round_hit_source_counts": dict(round_hit_source_counts),
         "rounds_with_forced_hit": rounds_with_forced_hit,
         "rounds_with_retrieved_hit": rounds_with_retrieved_hit,
         "platform_rows": platform_rows,
         "purchase_style_matrix": purchase_style_matrix,
         "target_rank_counts": dict(sorted(target_rank_counts.items())),
+        "settled_round_index": settled_round_index,
+        "purchase_trend_window": trend_window,
+        "recent_purchase_count_series": recent_purchase_count_series,
+        "recent_no_purchase_rate_series": recent_no_purchase_rate_series,
         "error_buckets": dict(error_buckets.most_common()),
         "error_examples": error_examples,
     }
@@ -282,6 +324,127 @@ def bar_rows(title: str, rows: List[Tuple[str, float, str]], color: str = "#2f6f
             f"<div class='bar-value'>{esc(value_text)}</div>"
             "</div>"
         )
+    parts.append("</div></section>")
+    return "".join(parts)
+
+
+def render_line_chart(
+    title: str,
+    x_values: List[int],
+    series_rows: List[Tuple[str, List[float], str]],
+    note: str = "",
+    y_kind: str = "count",
+) -> str:
+    non_empty_rows = [(label, values, color) for label, values, color in series_rows if values]
+    if not x_values or not non_empty_rows:
+        return f"<section><h2>{esc(title)}</h2><p>No data.</p></section>"
+
+    width = 860
+    height = 320
+    left = 56
+    right = 18
+    top = 18
+    bottom = 36
+    inner_w = width - left - right
+    inner_h = height - top - bottom
+
+    def nice_step(value: float) -> float:
+        if value <= 0:
+            return 1.0
+        magnitude = 10 ** math.floor(math.log10(value))
+        residual = value / magnitude
+        if residual <= 1:
+            nice = 1
+        elif residual <= 2:
+            nice = 2
+        elif residual <= 5:
+            nice = 5
+        else:
+            nice = 10
+        return nice * magnitude
+
+    raw_max_y = max(max(values) for _, values, _ in non_empty_rows)
+    if y_kind == "pct":
+        max_y = max(0.05, min(1.0, raw_max_y))
+        step = nice_step(max_y / 4.0)
+        max_y = min(1.0, step * max(1, int(math.ceil(max_y / step))))
+    else:
+        max_y = max(1.0, raw_max_y)
+        step = max(1.0, nice_step(max_y / 4.0))
+        max_y = step * max(1, int(math.ceil(max_y / step)))
+
+    def x_pos(index: int) -> float:
+        if len(x_values) <= 1:
+            return left + inner_w / 2.0
+        return left + inner_w * (index / float(len(x_values) - 1))
+
+    def y_pos(value: float) -> float:
+        clipped = max(0.0, min(max_y, float(value)))
+        return top + inner_h - (clipped / max_y) * inner_h
+
+    def y_label(value: float) -> str:
+        return pct_text(value) if y_kind == "pct" else num_text(value)
+
+    tick_count = max(1, int(round(max_y / step)))
+    x_tick_count = min(6, len(x_values))
+
+    parts = [f"<section><h2>{esc(title)}</h2><div class='chart-shell'>"]
+    parts.append(
+        f"<svg class='line-chart' viewBox='0 0 {width} {height}' role='img' aria-label='{esc(title)}'>"
+    )
+
+    for tick_idx in range(tick_count + 1):
+        frac = tick_idx / tick_count
+        y_value = max_y * frac
+        y = y_pos(y_value)
+        parts.append(
+            f"<line x1='{left}' y1='{y:.2f}' x2='{width - right}' y2='{y:.2f}' class='chart-grid' />"
+        )
+        parts.append(
+            f"<text x='{left - 8}' y='{y + 4:.2f}' text-anchor='end' class='chart-axis-label'>{esc(y_label(y_value))}</text>"
+        )
+
+    if x_tick_count == 1:
+        tick_indexes = [0]
+    else:
+        tick_indexes = sorted(
+            {
+                int(round(i * (len(x_values) - 1) / float(x_tick_count - 1)))
+                for i in range(x_tick_count)
+            }
+        )
+    for idx in tick_indexes:
+        x = x_pos(idx)
+        parts.append(
+            f"<line x1='{x:.2f}' y1='{top}' x2='{x:.2f}' y2='{top + inner_h}' class='chart-grid chart-grid-vertical' />"
+        )
+        parts.append(
+            f"<text x='{x:.2f}' y='{height - 10}' text-anchor='middle' class='chart-axis-label'>{x_values[idx]}</text>"
+        )
+
+    for label, values, color in non_empty_rows:
+        points = " ".join(f"{x_pos(i):.2f},{y_pos(v):.2f}" for i, v in enumerate(values))
+        last_x = x_pos(len(values) - 1)
+        last_y = y_pos(values[-1])
+        parts.append(
+            f"<polyline fill='none' stroke='{color}' stroke-width='3' stroke-linecap='round' stroke-linejoin='round' points='{points}' />"
+        )
+        parts.append(f"<circle cx='{last_x:.2f}' cy='{last_y:.2f}' r='4.5' fill='{color}' />")
+
+    parts.append("</svg>")
+    parts.append("<div class='chart-legend'>")
+    for label, values, color in non_empty_rows:
+        last_value = y_label(values[-1])
+        parts.append(
+            "<div class='legend-item'>"
+            f"<span class='legend-swatch' style='background:{color};'></span>"
+            f"<span>{esc(label)}</span>"
+            f"<strong>{esc(last_value)}</strong>"
+            "</div>"
+        )
+    parts.append("</div>")
+    if note:
+        parts.append(f"<p class='chart-note'>{esc(note)}</p>")
     parts.append("</div></section>")
     return "".join(parts)
 
@@ -517,6 +680,40 @@ def render_report(rounds_path: Path, metrics: Dict, rounds: List[Dict]) -> str:
     input_name = rounds_path.name
     round_hit_source_counts = metrics["round_hit_source_counts"]
     case_page_buttons, case_select_options, case_pages_html = render_case_pages(rounds)
+    settled_round_index = metrics["settled_round_index"]
+    purchase_trend_chart = render_line_chart(
+        title="Recent Purchase Count By Platform",
+        x_values=settled_round_index,
+        series_rows=[
+            (pid, metrics["recent_purchase_count_series"][pid], SERIES_COLORS[pid])
+            for pid in PLATFORM_IDS
+        ],
+        note=(
+            f"Each point counts purchases within the most recent {metrics['purchase_trend_window']} settled rounds. "
+            "This makes reputation-driven rise and decline easier to see."
+            if metrics["purchase_trend_window"]
+            else ""
+        ),
+        y_kind="count",
+    )
+    no_purchase_trend_chart = render_line_chart(
+        title="Recent No-Purchase Rate",
+        x_values=settled_round_index,
+        series_rows=[
+            (
+                "No purchase",
+                metrics["recent_no_purchase_rate_series"],
+                SERIES_COLORS["NO_PURCHASE"],
+            )
+        ],
+        note=(
+            f"Each point shows the no-purchase share within the most recent {metrics['purchase_trend_window']} settled rounds. "
+            f"Overall no-purchase rate on settled rounds: {pct_text(metrics['no_purchase_rate_on_settled'])}."
+            if metrics["purchase_trend_window"]
+            else ""
+        ),
+        y_kind="pct",
+    )
 
     target_rank_rows = [
         (f"target_rank={rank}", safe_pct(count, metrics["settled_count"]), f"{count}")
@@ -710,6 +907,57 @@ def render_report(rounds_path: Path, metrics: Dict, rounds: List[Dict]) -> str:
     .bar-fill {{
       height: 100%;
       border-radius: 999px;
+    }}
+    .chart-shell {{
+      display: grid;
+      gap: 12px;
+    }}
+    .line-chart {{
+      width: 100%;
+      height: auto;
+      display: block;
+      background: linear-gradient(180deg, rgba(255,255,255,0.68), rgba(255,255,255,0.40));
+      border: 1px solid rgba(217, 210, 197, 0.75);
+      border-radius: 16px;
+    }}
+    .chart-grid {{
+      stroke: rgba(111, 119, 135, 0.18);
+      stroke-width: 1;
+    }}
+    .chart-grid-vertical {{
+      stroke-dasharray: 4 6;
+    }}
+    .chart-axis-label {{
+      fill: var(--muted);
+      font-size: 12px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }}
+    .chart-legend {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px 14px;
+    }}
+    .legend-item {{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13px;
+      color: var(--ink);
+      padding: 6px 10px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.72);
+      border: 1px solid var(--line);
+    }}
+    .legend-swatch {{
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      flex: 0 0 auto;
+    }}
+    .chart-note {{
+      margin: 0;
+      font-size: 13px;
+      color: var(--muted);
     }}
     table {{
       width: 100%;
@@ -984,6 +1232,8 @@ def render_report(rounds_path: Path, metrics: Dict, rounds: List[Dict]) -> str:
       <div class="card"><div class="label">Total Rounds</div><div class="value">{metrics['total_rounds']}</div></div>
       <div class="card"><div class="label">Top-1 Hit Rate</div><div class="value">{pct_text(metrics['top1_rate_on_settled'])}</div></div>
       <div class="card"><div class="label">Avg Target Rank (Observed)</div><div class="value">{num_text(metrics['avg_target_rank'])}</div></div>
+      <div class="card"><div class="label">No-Purchase Rounds</div><div class="value">{metrics['no_purchase_count']}</div></div>
+      <div class="card"><div class="label">No-Purchase Rate (Settled)</div><div class="value">{pct_text(metrics['no_purchase_rate_on_settled'])}</div></div>
       <div class="card"><div class="label">Target Missing In Rank List</div><div class="value">{metrics['target_rank_missing_count']}</div></div>
       <div class="card"><div class="label">Forced Hit Rounds</div><div class="value">{metrics['rounds_with_forced_hit']}</div></div>
       <div class="card"><div class="label">Retrieved Hit Rounds (No Force)</div><div class="value">{metrics['rounds_with_retrieved_hit']}</div></div>
@@ -995,23 +1245,8 @@ def render_report(rounds_path: Path, metrics: Dict, rounds: List[Dict]) -> str:
     </div>
 
     <div class="grid two" style="margin-top: 18px;">
-      <section>
-        <h2>Definitions</h2>
-        <p class="small"><strong>Top-1 hit rate</strong> means <code>target_rank == 1</code> among settled rounds, when the real next item appeared in ranked candidates.</p>
-        <p class="small"><strong>Observed target rank</strong> is diagnostic only. Settlement usually follows the UA's rank-1 platform, unless the UA explicitly decides not to buy.</p>
-        <p class="small"><strong>Target Missing In Rank List</strong> counts settled rounds where the real next item never appeared anywhere in the final ranked candidates.</p>
-        <p class="small"><strong>Forced Hit Rounds</strong> counts settled rounds where at least one platform got the target item through the forced-hit override.</p>
-        <p class="small"><strong>Retrieved Hit Rounds (No Force)</strong> counts settled rounds where at least one platform naturally retrieved the target item without that override.</p>
-        <p class="small"><strong>Rounds With Target Hit Source</strong> is counted by round, not by item. If a round contains both forced and natural hits, it contributes to both bars.</p>
-        <p class="small"><strong>Purchase rate</strong> means how often a platform became the final purchased platform among settled rounds.</p>
-        <p class="small"><strong>Intended presence rate</strong> means how often a platform's candidate item matched the real next item among settled rounds.</p>
-      </section>
-      <section>
-        <h2>Reading Hint</h2>
-        <p class="small">If <code>Forced Hit Rounds</code> is much larger than <code>Retrieved Hit Rounds (No Force)</code>, target coverage is still relying mostly on injection rather than natural retrieval.</p>
-        <p class="small">If <code>Retrieved Hit Rounds (No Force)</code> stays at zero, the retriever is not surfacing the real next item on its own.</p>
-        <p class="small">A platform can still win the purchase even when the target item is missing, because settlement usually follows the UA's top-ranked result unless the UA outputs a no-purchase decision.</p>
-      </section>
+      {purchase_trend_chart}
+      {no_purchase_trend_chart}
     </div>
 
     <section style="margin-top: 18px;">
