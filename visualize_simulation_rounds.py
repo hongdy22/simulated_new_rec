@@ -332,6 +332,8 @@ def reason_badge(reason: str) -> str:
 def render_rank_list(round_obj: Dict) -> str:
     rank_list = [str(pid) for pid in (round_obj.get("ua_rank_list") or []) if str(pid).strip()]
     if not rank_list:
+        if bool(round_obj.get("no_purchase")):
+            return "<p class='small'>UA chose not to buy any candidate in this case.</p>"
         return "<p class='small'>No ranking output for this case.</p>"
 
     target_rank = int(round_obj.get("target_rank") or 0) if str(round_obj.get("target_rank") or "").isdigit() else 0
@@ -442,6 +444,7 @@ def render_case_pages(rounds: List[Dict]) -> Tuple[str, str, str]:
             if candidate_hit_reason(round_obj, candidate) == "retrieved"
         ]
         purchased_pid = purchased_platform_of(round_obj)
+        purchased_label = "No purchase" if bool(round_obj.get("no_purchase")) else (purchased_pid or "N/A")
         purchased_item = round_obj.get("purchased_item") or {}
         profile_memory = str(round_obj.get("profile_memory_update") or "")
         ua_rationale = str(round_obj.get("ua_rationale") or "")
@@ -458,7 +461,7 @@ def render_case_pages(rounds: List[Dict]) -> Tuple[str, str, str]:
             f"<div class='mini-card'><div class='label'>Status</div><div>{status_badge(status)}</div></div>"
             f"<div class='mini-card'><div class='label'>Style</div><div>{esc(style)}</div></div>"
             f"<div class='mini-card'><div class='label'>Target ASIN</div><div><code>{esc(round_obj.get('target_asin') or 'N/A')}</code></div></div>"
-            f"<div class='mini-card'><div class='label'>Purchased Platform</div><div>{esc(purchased_pid or 'N/A')}</div></div>"
+            f"<div class='mini-card'><div class='label'>Purchased Platform</div><div>{esc(purchased_label)}</div></div>"
             f"<div class='mini-card'><div class='label'>Target Rank</div><div>{esc(round_obj.get('target_rank') or 'N/A')}</div></div>"
             f"<div class='mini-card'><div class='label'>Query ID</div><div><code>{esc(round_obj.get('query_id') or 'N/A')}</code></div></div>"
             "</div>"
@@ -485,7 +488,7 @@ def render_case_pages(rounds: List[Dict]) -> Tuple[str, str, str]:
             f"<p><strong>Intended Platforms:</strong> {chip_list(intended_pids, 'chip-accent')}</p>"
             f"<p><strong>Forced Hit Platforms:</strong> {chip_list(forced_pids, 'chip-warn')}</p>"
             f"<p><strong>Retrieved Hit Platforms:</strong> {chip_list(retrieved_pids, 'chip-good')}</p>"
-            f"<p><strong>Purchased Platform:</strong> {esc(purchased_pid or 'N/A')}</p>"
+            f"<p><strong>Purchased Platform:</strong> {esc(purchased_label)}</p>"
             f"<p><strong>Purchased Item:</strong> {esc(short_text(purchased_item.get('title') or 'N/A', 140))}</p>"
             f"<p><strong>Profile Update:</strong> {esc(profile_memory or 'None')}</p>"
             f"<p><strong>Penalty Platforms:</strong> {chip_list(penalty_pids, 'chip-warn')}</p>"
@@ -995,7 +998,7 @@ def render_report(rounds_path: Path, metrics: Dict, rounds: List[Dict]) -> str:
       <section>
         <h2>Definitions</h2>
         <p class="small"><strong>Top-1 hit rate</strong> means <code>target_rank == 1</code> among settled rounds, when the real next item appeared in ranked candidates.</p>
-        <p class="small"><strong>Observed target rank</strong> is diagnostic only. Settlement always follows the UA's rank-1 platform as the purchased outcome.</p>
+        <p class="small"><strong>Observed target rank</strong> is diagnostic only. Settlement usually follows the UA's rank-1 platform, unless the UA explicitly decides not to buy.</p>
         <p class="small"><strong>Target Missing In Rank List</strong> counts settled rounds where the real next item never appeared anywhere in the final ranked candidates.</p>
         <p class="small"><strong>Forced Hit Rounds</strong> counts settled rounds where at least one platform got the target item through the forced-hit override.</p>
         <p class="small"><strong>Retrieved Hit Rounds (No Force)</strong> counts settled rounds where at least one platform naturally retrieved the target item without that override.</p>
@@ -1007,7 +1010,7 @@ def render_report(rounds_path: Path, metrics: Dict, rounds: List[Dict]) -> str:
         <h2>Reading Hint</h2>
         <p class="small">If <code>Forced Hit Rounds</code> is much larger than <code>Retrieved Hit Rounds (No Force)</code>, target coverage is still relying mostly on injection rather than natural retrieval.</p>
         <p class="small">If <code>Retrieved Hit Rounds (No Force)</code> stays at zero, the retriever is not surfacing the real next item on its own.</p>
-        <p class="small">A platform can still win the purchase even when the target item is missing, because settlement now always follows the UA's top-ranked result.</p>
+        <p class="small">A platform can still win the purchase even when the target item is missing, because settlement usually follows the UA's top-ranked result unless the UA outputs a no-purchase decision.</p>
       </section>
     </div>
 

@@ -28,6 +28,7 @@ PITCH_STYLE_GUIDES = {
 
 CACHE_FORMAT_VERSION = 1
 RETRIEVAL_TEXT_VERSION = 1
+NO_PURCHASE_DECISION = "NO_PURCHASE"
 
 
 @dataclass
@@ -639,11 +640,18 @@ def parse_json_object(text: str) -> Optional[Dict]:
 def parse_rank_list(text: str, valid_ids: List[str]) -> Optional[List[str]]:
     obj = parse_json_object(text)
     if obj:
-        raw = obj.get("ranked_platform_ids") or obj.get("rank_list")
+        raw = obj["ranked_platform_ids"] if "ranked_platform_ids" in obj else obj.get("rank_list")
+        decision = str(obj.get("decision") or "").strip().upper()
+        no_purchase_flag = str(obj.get("no_purchase") or "").strip().lower() == "true"
+        if (no_purchase_flag or decision == NO_PURCHASE_DECISION) and raw == []:
+            return []
         if isinstance(raw, list):
             rank = [str(x) for x in raw]
             if sorted(rank) == sorted(valid_ids):
                 return rank
+
+    if re.search(rf"\b{NO_PURCHASE_DECISION}\b", text):
+        return []
 
     ids = re.findall(r"P\d+", text)
     if not ids:
@@ -1261,9 +1269,11 @@ Candidate list (already shuffled):
 Output JSON only:
 {{
   "ranked_platform_ids": ["P1","P2","P3","P4","P5"],
-    "rationale": "brief explanation"
+  "rationale": "brief explanation"
 }}
 ranked_platform_ids must include all platforms exactly once.
+If none of the candidates is a good purchase, output this exact decision format instead:
+{{"decision":"{NO_PURCHASE_DECISION}","no_purchase":true,"ranked_platform_ids":[],"rationale":"brief explanation"}}
 """.strip()
 
     raw = llm_chat_json(
@@ -1574,22 +1584,30 @@ def run_simulation(args: argparse.Namespace) -> None:
                                 ),
                                 None,
                             )
-                            purchased_pid = rank_list[0]
-                            purchased_candidate = candidate_map[purchased_pid]
-                            reputation_memory = generate_purchase_reputation_memory(
-                                client=client,
-                                model=chat_model,
-                                max_retries=args.max_retries,
-                                user_query=prepared["user_query"],
-                                target_item=prepared["target_item"],
-                                purchased_candidate=purchased_candidate,
-                            )
-                            append_profile_memory(
-                                profiles=platform_profiles,
-                                platform_id=purchased_pid,
-                                entry=reputation_memory,
-                                window_size=args.profile_window_size,
-                            )
+                            purchased_pid = rank_list[0] if rank_list else ""
+                            purchased_candidate = candidate_map.get(purchased_pid)
+                            reputation_memory = ""
+                            purchased_item = {}
+                            purchased_pitch = ""
+                            purchased_pitch_style = ""
+                            if purchased_candidate is not None:
+                                reputation_memory = generate_purchase_reputation_memory(
+                                    client=client,
+                                    model=chat_model,
+                                    max_retries=args.max_retries,
+                                    user_query=prepared["user_query"],
+                                    target_item=prepared["target_item"],
+                                    purchased_candidate=purchased_candidate,
+                                )
+                                append_profile_memory(
+                                    profiles=platform_profiles,
+                                    platform_id=purchased_pid,
+                                    entry=reputation_memory,
+                                    window_size=args.profile_window_size,
+                                )
+                                purchased_item = purchased_candidate.item.to_pitch_payload()
+                                purchased_pitch = purchased_candidate.pitch
+                                purchased_pitch_style = purchased_candidate.pitch_style
 
                             round_obj.update(
                                 {
@@ -1600,12 +1618,13 @@ def run_simulation(args: argparse.Namespace) -> None:
                                     "intended_platform_ids": prepared["intended_platform_ids"],
                                     "ua_rank_list": rank_list,
                                     "ua_rationale": rationale,
+                                    "no_purchase": purchased_candidate is None,
                                     "target_rank": first_target_rank,
                                     "reward_platform": purchased_pid,
                                     "purchased_platform": purchased_pid,
-                                    "purchased_item": purchased_candidate.item.to_pitch_payload(),
-                                    "purchased_pitch": purchased_candidate.pitch,
-                                    "purchased_pitch_style": purchased_candidate.pitch_style,
+                                    "purchased_item": purchased_item,
+                                    "purchased_pitch": purchased_pitch,
+                                    "purchased_pitch_style": purchased_pitch_style,
                                     "penalty_platforms": [],
                                     "profile_memory_update": reputation_memory,
                                 }
