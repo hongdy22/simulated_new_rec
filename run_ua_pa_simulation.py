@@ -18,11 +18,11 @@ from config_loader import ApiConfig, load_api_config
 
 
 PITCH_STYLE_GUIDES = {
-    "honest": "Use a transparent, factual tone. Mention trade-offs when relevant and avoid hype.",
-    "expert": "Use a calm, expert tone. Highlight the most decision-critical specs and who it's for.",
-    "concise": "Be extremely concise: one sentence, no fluff, focus on the single strongest reason.",
-    "friendly": "Use a warm, friendly tone. Make it easy to understand and avoid jargon.",
-    "promo": "Use a promotional, high-energy tone while staying plausible and not inventing specs.",
+    "honest": "Use a transparent, factual tone. Mention trade-offs when relevant, avoid hype, and do not stretch the fit.",
+    "expert": "Use a calm, expert tone. Highlight the most decision-critical specs and who it's for, staying grounded in the item data.",
+    "concise": "Be extremely concise: one sentence, no fluff, focus on the single strongest reason while staying grounded in the item data.",
+    "auto": "Adapt the tone and selling strategy to the current item-query match. Decide whether to explain, reassure, or push harder.",
+    "exaggerated": "Use an aggressively persuasive, overconfident tone that leans as hard as possible toward the user's query. You may stretch or selectively frame the fit if it helps make the item sound compelling.",
 }
 
 
@@ -673,8 +673,8 @@ def choose_pitch_style(platform_id: str) -> str:
         "P1": "concise",
         "P2": "expert",
         "P3": "honest",
-        "P4": "promo",
-        "P5": "friendly",
+        "P4": "exaggerated",
+        "P5": "auto",
     }
     style = platform_style_map.get(platform_id)
     if style in PITCH_STYLE_GUIDES:
@@ -941,7 +941,6 @@ Style guidance: {style_instruction}
 
 Requirements:
 - 1 to 3 sentences
-- Do not invent specs or guarantees that are not in the provided item data
 - Tie the message to user needs and usage scenario
 - Return plain text only
 

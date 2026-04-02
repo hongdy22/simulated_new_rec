@@ -14,16 +14,16 @@ from config_loader import ApiConfig, load_api_config
 
 
 STYLE_GUIDES = {
-    "concise": "Write a short, keyword-like shopping query in 8-18 words.",
-    "detailed": "Write a detailed shopping query in 1-2 sentences with concrete needs and constraints.",
-    "feature_focused": "Write a query emphasizing functional features and compatibility details.",
+    "concise": "Write a short, keyword-like shopping query in 8-18 words with a direct purchase intent.",
     "scenario": "Write a query grounded in a realistic usage scenario and context.",
-    "budget_conscious": "Write a query that clearly states a budget range and value-for-money priorities.",
     "comparison": "Write a query that compares 2-3 alternatives or asks 'which is better' with criteria.",
     "compatibility": "Write a query emphasizing compatibility requirements (model, interface, size, format).",
     "beginner_friendly": "Write a query as a beginner asking for easy-to-use, low-risk recommendations.",
     "pro_grade": "Write a query as an experienced user emphasizing performance, durability, and pro features.",
-    "minimalist": "Write a very short query in 4-10 words, focusing only on the core product and 1 key constraint.",
+    "upgrade": "Write a query from a user who already has some gear and now wants a clear upgrade or next-step purchase.",
+    "troubleshooting": "Write a query driven by a concrete annoyance, limitation, or problem the user is trying to solve.",
+    "taste_driven": "Write a query led by taste, vibe, sound character, aesthetics, or the kind of feeling the user wants.",
+    "serendipitous": "Write a query that starts from an adjacent need, curiosity, or browsing interest and could plausibly lead the user to discover a different target item.",
 }
 
 
