@@ -117,6 +117,58 @@ def intended_platform_ids_of(round_obj: Dict) -> List[str]:
     return intended
 
 
+def ua_target_rank_of(round_obj: Dict) -> int:
+    raw = round_obj.get("ua_target_rank")
+    if isinstance(raw, int) or str(raw or "").isdigit():
+        return int(raw)
+    return 0
+
+
+def merchant_has_target_candidate(round_obj: Dict) -> bool:
+    return bool(intended_platform_ids_of(round_obj))
+
+
+def user_selected_target_item(round_obj: Dict) -> bool:
+    target_asin = str(round_obj.get("target_asin") or "")
+    if not target_asin:
+        return False
+
+    user_decision = user_decision_of(round_obj)
+    selected_item = user_decision.get("selected_item") or {}
+    selected_asin = str(selected_item.get("parent_asin") or "")
+    if not selected_asin:
+        selected_pid = str(user_decision.get("selected_platform_id") or "")
+        for candidate in candidate_pool_of(round_obj):
+            if str(candidate.get("platform_id") or "") == selected_pid:
+                selected_asin = str((candidate.get("item") or {}).get("parent_asin") or "")
+                break
+    return bool(selected_asin) and selected_asin == target_asin
+
+
+def cumulative_regret_series(
+    rounds: List[Dict],
+    eligible_fn,
+    regret_fn,
+) -> Dict[str, object]:
+    eligible_count = 0
+    regret_count = 0
+    rate_series: List[float] = []
+
+    for round_obj in rounds:
+        if eligible_fn(round_obj):
+            eligible_count += 1
+            if regret_fn(round_obj):
+                regret_count += 1
+        rate_series.append(safe_pct(regret_count, eligible_count))
+
+    return {
+        "eligible_count": eligible_count,
+        "regret_count": regret_count,
+        "regret_rate": safe_pct(regret_count, eligible_count),
+        "rate_series": rate_series if eligible_count else [],
+    }
+
+
 def error_bucket(message: str) -> str:
     msg = str(message or "").strip()
     if not msg:
@@ -226,7 +278,7 @@ def compute_metrics(rounds: List[Dict]) -> Dict:
         if bool(reputation_update.get("applied")):
             reputation_update_count += 1
 
-        ua_target_rank = int(round_obj.get("ua_target_rank") or 0)
+        ua_target_rank = ua_target_rank_of(round_obj)
         if ua_target_rank <= 0:
             ua_target_missing_from_shortlist_count += 1
 
@@ -298,6 +350,17 @@ def compute_metrics(rounds: List[Dict]) -> Dict:
                 safe_pct(counts.get("NO_PURCHASE", 0), len(window_events))
             )
 
+    ua_shortlist_regret = cumulative_regret_series(
+        settled_rounds,
+        eligible_fn=merchant_has_target_candidate,
+        regret_fn=lambda round_obj: ua_target_rank_of(round_obj) <= 0,
+    )
+    user_choice_regret = cumulative_regret_series(
+        settled_rounds,
+        eligible_fn=lambda round_obj: ua_target_rank_of(round_obj) > 0,
+        regret_fn=lambda round_obj: not user_selected_target_item(round_obj),
+    )
+
     return {
         "total_rounds": total_rounds,
         "settled_count": settled_count,
@@ -319,6 +382,14 @@ def compute_metrics(rounds: List[Dict]) -> Dict:
         "purchase_trend_window": trend_window,
         "recent_purchase_count_series": recent_purchase_count_series,
         "recent_user_no_purchase_rate_series": recent_user_no_purchase_rate_series,
+        "ua_shortlist_regret_eligible_count": int(ua_shortlist_regret["eligible_count"]),
+        "ua_shortlist_regret_count": int(ua_shortlist_regret["regret_count"]),
+        "ua_shortlist_regret_rate": float(ua_shortlist_regret["regret_rate"]),
+        "ua_shortlist_regret_rate_series": list(ua_shortlist_regret["rate_series"]),
+        "user_choice_regret_eligible_count": int(user_choice_regret["eligible_count"]),
+        "user_choice_regret_count": int(user_choice_regret["regret_count"]),
+        "user_choice_regret_rate": float(user_choice_regret["regret_rate"]),
+        "user_choice_regret_rate_series": list(user_choice_regret["rate_series"]),
         "error_buckets": dict(error_buckets.most_common()),
         "error_examples": error_examples,
     }
@@ -744,6 +815,46 @@ def render_report(rounds_path: Path, metrics: Dict, rounds: List[Dict]) -> str:
             f"Overall user no-purchase rate on settled rounds: {pct_text(metrics['user_no_purchase_rate_on_settled'])}."
             if metrics["purchase_trend_window"]
             else ""
+        ),
+        y_kind="pct",
+    )
+    ua_shortlist_regret_chart = render_line_chart(
+        title="UA Miss Rate When Merchant Had Target",
+        x_values=settled_round_index,
+        series_rows=[
+            (
+                "UA miss regret",
+                metrics["ua_shortlist_regret_rate_series"],
+                "#8a4fd1",
+            )
+        ],
+        note=(
+            "Each point is the cumulative miss rate on settled rounds where at least one merchant candidate "
+            "already matched the target item. "
+            f"Final: {metrics['ua_shortlist_regret_count']} missed / {metrics['ua_shortlist_regret_eligible_count']} eligible "
+            f"= {pct_text(metrics['ua_shortlist_regret_rate'])}."
+            if metrics["ua_shortlist_regret_eligible_count"]
+            else "No settled rounds where any merchant candidate matched the target item."
+        ),
+        y_kind="pct",
+    )
+    user_choice_regret_chart = render_line_chart(
+        title="User Regret Rate When UA Surfaced Target",
+        x_values=settled_round_index,
+        series_rows=[
+            (
+                "User choice regret",
+                metrics["user_choice_regret_rate_series"],
+                "#bf3d3d",
+            )
+        ],
+        note=(
+            "Each point is the cumulative regret rate on settled rounds where the UA shortlist already contained "
+            "the target item. A regret event means the user still did not choose that target item. "
+            f"Final: {metrics['user_choice_regret_count']} regrets / {metrics['user_choice_regret_eligible_count']} eligible "
+            f"= {pct_text(metrics['user_choice_regret_rate'])}."
+            if metrics["user_choice_regret_eligible_count"]
+            else "No settled rounds where the UA shortlist contained the target item."
         ),
         y_kind="pct",
     )
@@ -1283,6 +1394,11 @@ def render_report(rounds_path: Path, metrics: Dict, rounds: List[Dict]) -> str:
     <div class="grid two" style="margin-top: 18px;">
       {purchase_trend_chart}
       {no_purchase_trend_chart}
+    </div>
+
+    <div class="grid two" style="margin-top: 18px;">
+      {ua_shortlist_regret_chart}
+      {user_choice_regret_chart}
     </div>
 
     <section style="margin-top: 18px;">
