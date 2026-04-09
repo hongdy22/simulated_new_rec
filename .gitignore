@@ -1,6 +1,7 @@
 config.json
 .venv/
 output/
+output*/
 __pycache__/
 .vscode/
 .DS_Store

@@ -2,6 +2,7 @@
 import argparse
 import hashlib
 import json
+import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -9,7 +10,11 @@ from functools import partial
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from openai import OpenAI
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None  # type: ignore
+
 from config_loader import ApiConfig, load_api_config
 
 
@@ -52,7 +57,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-users",
         type=int,
-        default=50,
+        default=5,
         help="Maximum number of users to process. 0 means all",
     )
     parser.add_argument(
@@ -117,6 +122,72 @@ def format_history(history: List[Dict]) -> str:
     return "\n".join(lines)
 
 
+def parse_json_object(text: str) -> Optional[Dict]:
+    body = (text or "").strip()
+    if not body:
+        return None
+
+    try:
+        obj = json.loads(body)
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        pass
+
+    match = re.search(r"\{.*\}", body, flags=re.DOTALL)
+    if not match:
+        return None
+
+    try:
+        obj = json.loads(match.group(0))
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        return None
+    return None
+
+
+def build_fallback_implicit_state(style: str, history: List[Dict], target: Dict) -> str:
+    recent_titles = [
+        safe_text(item.get("title"))
+        for item in history[-2:]
+        if safe_text(item.get("title"))
+    ]
+    target_title = safe_text(target.get("title"))
+    style_signal = {
+        "concise": "They are drawn to options that feel immediately right without wanting to over-explain why.",
+        "scenario": "They picture how the item will fit into a lived routine and respond strongly to that imagined fit.",
+        "comparison": "They compare options carefully on the surface, but the final pull is often a quieter emotional preference.",
+        "compatibility": "They talk about practical fit, while privately caring whether the choice feels frictionless and reassuring long term.",
+        "beginner_friendly": "They want to feel safe and competent, even if they cannot clearly state that emotional need.",
+        "pro_grade": "They are quietly motivated by wanting their setup to feel more serious and identity-consistent.",
+        "upgrade": "They are not only chasing utility; they want the next purchase to feel like a meaningful personal step forward.",
+        "troubleshooting": "They describe the problem directly, but what really matters is removing a lingering low-level frustration or doubt.",
+        "taste_driven": "They may justify the purchase practically, while actually responding most to whether it matches their taste and self-image.",
+        "serendipitous": "They are open to being moved by something adjacent that unexpectedly feels more 'them' than the obvious match.",
+    }.get(
+        style,
+        "They may say one thing explicitly while being guided by a softer, harder-to-name sense of personal fit.",
+    )
+
+    if recent_titles:
+        history_signal = (
+            "Their recent history suggests they keep circling back to "
+            + ", ".join(recent_titles)
+            + "."
+        )
+    elif target_title:
+        history_signal = (
+            f"They may be more responsive to something that resonates with the broader trajectory that eventually led to {target_title}."
+        )
+    else:
+        history_signal = (
+            "Their past choices suggest the final decision may depend on a subtle feeling of fit rather than explicit requirements alone."
+        )
+
+    return safe_text(f"{style_signal} {history_signal}")
+
+
 def build_prompt(style: str, user_id: str, history: List[Dict], target: Dict) -> str:
     target_title = safe_text(target.get("title")) or "Unknown title"
     target_rating = target.get("rating")
@@ -128,7 +199,8 @@ You are simulating a real user's shopping intent query for a recommendation expe
 
 Task:
 - Infer user preference from history.
-- Generate ONE plausible pre-purchase user query that could lead to this target item.
+- Generate ONE plausible pre-purchase user query that could plausibly lead into the broader shopping path.
+- Also generate ONE hidden implicit user state that the user would not clearly articulate and would not tell a user agent.
 - Follow the required style.
 
 Style requirement:
@@ -143,10 +215,46 @@ rating={target_rating}
 review={target_text}
 
 Output rules:
-- Return only the query text.
-- Keep it natural and human-like.
+- Return JSON only with exactly these keys:
+  {{
+    "query_text": "...",
+    "implicit_state": "..."
+  }}
+- query_text:
+  - natural and human-like
+  - one shopping query only
+  - must follow the requested style
+  - should sound like what the user would actually type or say before purchase
+- implicit_state:
+  - 1 to 2 sentences
+  - describe a subtle inner state, psychological pull, taste bias, or unspoken tendency
+  - it should come from the user's history + style + target item together
+  - it may be lightly constrained by the target item, but must NOT simply restate the target title or explicit query need
+  - it should help explain why the final user choice may differ from the most obviously query-relevant item
+  - it should feel real-world and somewhat hard for the user to verbalize
 - Do not mention internal fields like parent_asin/user_id/timestamp.
 """.strip()
+
+
+def parse_generation_output(raw_text: str, style: str, history: List[Dict], target: Dict) -> Dict[str, str]:
+    obj = parse_json_object(raw_text)
+    if obj:
+        query_text = safe_text(obj.get("query_text")) or safe_text(raw_text)
+        implicit_state = safe_text(obj.get("implicit_state"))
+        if query_text and implicit_state:
+            return {
+                "query_text": query_text,
+                "implicit_state": implicit_state,
+            }
+
+    query_text = safe_text(raw_text)
+    if not query_text:
+        query_text = "looking for a good option that feels right for what I need"
+
+    return {
+        "query_text": query_text,
+        "implicit_state": build_fallback_implicit_state(style, history, target),
+    }
 
 
 def call_model(
@@ -164,7 +272,10 @@ def call_model(
                 messages=[
                     {
                         "role": "system",
-                        "content": "You generate realistic e-commerce user search queries.",
+                        "content": (
+                            "You generate realistic e-commerce user search intent records in strict JSON. "
+                            "Never return markdown."
+                        ),
                     },
                     {"role": "user", "content": prompt},
                 ],
@@ -188,6 +299,8 @@ def make_query_id(user_id: str, target: Dict) -> str:
 
 
 def make_client(api: ApiConfig) -> OpenAI:
+    if OpenAI is None:
+        raise RuntimeError("Missing dependency: openai. Install with `pip install openai`.")
     return OpenAI(base_url=api.base_url, api_key=api.api_key, timeout=api.timeout_seconds)
 
 
@@ -231,7 +344,7 @@ def generate_query_record(
     prompt = build_prompt(style=style, user_id=user_id, history=history, target=target)
 
     try:
-        query = call_model(
+        raw_text = call_model(
             client=make_client(api),
             model=model,
             prompt=prompt,
@@ -246,12 +359,22 @@ def generate_query_record(
             "error": str(err),
         }
 
+    generated = parse_generation_output(
+        raw_text=raw_text,
+        style=style,
+        history=history,
+        target=target,
+    )
+
     return {
         "query_id": make_query_id(user_id, target),
         "source_line": job["source_line"],
         "user_id": user_id,
-        "query_style": style,
-        "query_text": query,
+        "user_context": {
+            "query_text": generated["query_text"],
+            "persona_style": style,
+            "implicit_state": generated["implicit_state"],
+        },
         "target_item": {
             "parent_asin": target.get("parent_asin"),
             "title": target.get("title"),
@@ -260,14 +383,6 @@ def generate_query_record(
             "text": target.get("text"),
         },
         "history_items": history,
-        "ua_query_packet": {
-            "query": query,
-            "style": style,
-            "user_id": user_id,
-            "target_parent_asin": target.get("parent_asin"),
-            "target_title": target.get("title"),
-            "target_timestamp": target.get("timestamp"),
-        },
         "status": "ok",
     }
 

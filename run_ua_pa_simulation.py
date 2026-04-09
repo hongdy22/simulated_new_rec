@@ -13,7 +13,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
-from openai import OpenAI
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None  # type: ignore
+
 from config_loader import ApiConfig, load_api_config
 
 
@@ -28,7 +32,7 @@ PITCH_STYLE_GUIDES = {
 
 CACHE_FORMAT_VERSION = 1
 RETRIEVAL_TEXT_VERSION = 1
-NO_PURCHASE_DECISION = "NO_PURCHASE"
+UA_SHORTLIST_SIZE = 3
 
 
 @dataclass
@@ -61,6 +65,15 @@ class PlatformCandidate:
     pitch_style: str
     retrieval_score: float
     forced_intended_hit: bool
+
+
+@dataclass
+class UaShortlistEntry:
+    rank: int
+    platform_id: str
+    item_title: str
+    merchant_pitch: str
+    ua_reason: str
 
 
 def item_to_cache_payload(item: Item) -> Dict:
@@ -395,7 +408,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-queries",
         type=int,
-        default=50,
+        default=5,
         help="Maximum number of queries to run. 0 means all",
     )
     parser.add_argument(
@@ -407,13 +420,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--intended-hit-prob",
         type=float,
-        default=0.1,
+        default=0.2,
         help="If intended item exists in platform catalog, chance to force-hit it",
     )
     parser.add_argument(
         "--profile-window-size",
         type=int,
-        default=5,
+        default=8,
         help="Sliding window size for platform reputation memory entries",
     )
     parser.add_argument(
@@ -430,8 +443,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--embedding-local-only",
-        action="store_true",
-        help="Only load embedding model from local files (no network)",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Only load embedding model from local files (no network). Enabled by default; use --no-embedding-local-only to allow network access.",
     )
     parser.add_argument(
         "--embedding-device",
@@ -466,7 +480,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-retries",
         type=int,
-        default=3,
+        default=5,
         help="Retries for each API request",
     )
     parser.add_argument(
@@ -503,6 +517,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def make_client(api: ApiConfig) -> OpenAI:
+    if OpenAI is None:
+        raise RuntimeError("Missing dependency: openai. Install with `pip install openai`.")
     return OpenAI(base_url=api.base_url, api_key=api.api_key, timeout=api.timeout_seconds)
 
 
@@ -543,6 +559,27 @@ def format_history_for_ua(history_items: Sequence[Dict]) -> str:
             parts.append(f"review={review}")
         lines.append(f"{idx}. " + " | ".join(parts))
     return "\n".join(lines)
+
+
+def normalize_user_context(query_record: Dict) -> Dict[str, str]:
+    user_context = query_record.get("user_context") or {}
+    if not isinstance(user_context, dict):
+        user_context = {}
+
+    query_text = clean_text(
+        user_context.get("query_text") or query_record.get("query_text"),
+        280,
+    )
+    persona_style = clean_text(
+        user_context.get("persona_style") or query_record.get("query_style"),
+        80,
+    )
+    implicit_state = clean_text(user_context.get("implicit_state"), 320)
+    return {
+        "query_text": query_text,
+        "persona_style": persona_style,
+        "implicit_state": implicit_state,
+    }
 
 
 def fallback_long_term_need(history_items: Sequence[Dict], query: str) -> str:
@@ -637,34 +674,112 @@ def parse_json_object(text: str) -> Optional[Dict]:
     return None
 
 
-def parse_rank_list(text: str, valid_ids: List[str]) -> Optional[List[str]]:
+def parse_ua_shortlist_response(text: str, valid_ids: List[str]) -> Optional[List[Dict[str, str]]]:
+    valid_set = set(valid_ids)
     obj = parse_json_object(text)
     if obj:
-        raw = obj["ranked_platform_ids"] if "ranked_platform_ids" in obj else obj.get("rank_list")
-        decision = str(obj.get("decision") or "").strip().upper()
-        no_purchase_flag = str(obj.get("no_purchase") or "").strip().lower() == "true"
-        if (no_purchase_flag or decision == NO_PURCHASE_DECISION) and raw == []:
-            return []
-        if isinstance(raw, list):
-            rank = [str(x) for x in raw]
-            if sorted(rank) == sorted(valid_ids):
-                return rank
+        ranked_items = obj.get("ranked_items")
+        if isinstance(ranked_items, list):
+            parsed: List[Dict[str, str]] = []
+            seen = set()
+            for row in ranked_items:
+                if not isinstance(row, dict):
+                    continue
+                pid = str(row.get("platform_id") or row.get("platform") or "").strip()
+                reason = clean_text(row.get("ua_reason") or row.get("reason"), 320)
+                if pid in valid_set and pid not in seen:
+                    parsed.append(
+                        {
+                            "platform_id": pid,
+                            "ua_reason": reason or "Selected by the UA as one of the strongest options to show next.",
+                        }
+                    )
+                    seen.add(pid)
+            if len(parsed) == UA_SHORTLIST_SIZE:
+                return parsed
 
-    if re.search(rf"\b{NO_PURCHASE_DECISION}\b", text):
-        return []
+        raw_rank = obj["ranked_platform_ids"] if "ranked_platform_ids" in obj else obj.get("rank_list")
+        reason_map = obj.get("item_reasons") or obj.get("reasons") or {}
+        if isinstance(raw_rank, list):
+            rank = []
+            seen = set()
+            for pid in raw_rank:
+                pid_text = str(pid).strip()
+                if pid_text in valid_set and pid_text not in seen:
+                    rank.append(pid_text)
+                    seen.add(pid_text)
+                if len(rank) >= UA_SHORTLIST_SIZE:
+                    break
+            if len(rank) == UA_SHORTLIST_SIZE:
+                parsed = []
+                for pid in rank:
+                    reason = ""
+                    if isinstance(reason_map, dict):
+                        reason = clean_text(reason_map.get(pid), 320)
+                    parsed.append(
+                        {
+                            "platform_id": pid,
+                            "ua_reason": reason or "Selected by the UA as one of the strongest options to show next.",
+                        }
+                    )
+                return parsed
 
     ids = re.findall(r"P\d+", text)
-    if not ids:
+    if len(ids) < UA_SHORTLIST_SIZE:
         return None
 
-    rank: List[str] = []
+    parsed = []
     seen = set()
     for pid in ids:
-        if pid in valid_ids and pid not in seen:
-            rank.append(pid)
+        if pid in valid_set and pid not in seen:
+            parsed.append(
+                {
+                    "platform_id": pid,
+                    "ua_reason": "Selected by the UA as one of the strongest options to show next.",
+                }
+            )
             seen.add(pid)
-    if sorted(rank) == sorted(valid_ids):
-        return rank
+        if len(parsed) >= UA_SHORTLIST_SIZE:
+            return parsed
+    return None
+
+
+def parse_user_decision_output(text: str, valid_ids: List[str]) -> Optional[Dict[str, str]]:
+    valid_set = set(valid_ids)
+    obj = parse_json_object(text)
+    if obj:
+        decision = str(obj.get("decision") or "").strip().lower()
+        selected_pid = str(obj.get("selected_platform_id") or "").strip()
+        reason = clean_text(obj.get("reason"), 320)
+
+        if decision == "no_purchase":
+            return {
+                "decision": "no_purchase",
+                "selected_platform_id": "",
+                "reason": reason or "The shortlist did not feel right enough to justify buying now.",
+            }
+        if decision == "purchase" and selected_pid in valid_set:
+            return {
+                "decision": "purchase",
+                "selected_platform_id": selected_pid,
+                "reason": reason or "The selected option felt like the strongest fit once the user saw the shortlist.",
+            }
+
+    lowered = text.lower()
+    if "no_purchase" in lowered or "not buy" in lowered or "won't buy" in lowered:
+        return {
+            "decision": "no_purchase",
+            "selected_platform_id": "",
+            "reason": "The shortlist did not feel convincing enough to trigger a purchase.",
+        }
+
+    for pid in re.findall(r"P\d+", text):
+        if pid in valid_set:
+            return {
+                "decision": "purchase",
+                "selected_platform_id": pid,
+                "reason": "Fallback parse inferred a concrete platform choice from the user decision output.",
+            }
     return None
 
 
@@ -795,8 +910,8 @@ def ua_structure_query(
     max_retries: int,
     query_record: Dict,
 ) -> Dict:
-    query = query_record.get("query_text", "")
-    style = query_record.get("query_style", "")
+    user_context = normalize_user_context(query_record)
+    query = user_context["query_text"]
     history_items = query_record.get("history_items") or []
 
     user_prompt = f"""
@@ -831,7 +946,6 @@ query_text={query}
     fallback = {
         "long_term_need": fallback_long_term_need(history_items, query),
         "current_need": clean_text(str(query), 180),
-        "style": style,
     }
 
     try:
@@ -847,7 +961,6 @@ query_text={query}
                     str(obj.get("current_need") or fallback["current_need"]),
                     180,
                 ),
-                "style": style,
             }
     except Exception:
         pass
@@ -974,6 +1087,51 @@ def serialize_candidate(candidate: PlatformCandidate) -> Dict:
         "retrieval_score": candidate.retrieval_score,
         "forced_intended_hit": candidate.forced_intended_hit,
     }
+
+
+def build_ua_shortlist_entries(
+    ranked_rows: List[Dict[str, str]],
+    candidate_map: Dict[str, PlatformCandidate],
+) -> List[Dict]:
+    shortlist: List[Dict] = []
+    for idx, row in enumerate(ranked_rows, start=1):
+        pid = str(row.get("platform_id") or "").strip()
+        candidate = candidate_map.get(pid)
+        if candidate is None:
+            continue
+        entry = UaShortlistEntry(
+            rank=idx,
+            platform_id=pid,
+            item_title=clean_text(candidate.item.title, 220),
+            merchant_pitch=clean_text(candidate.pitch, 420),
+            ua_reason=clean_text(row.get("ua_reason"), 320)
+            or "Selected by the UA as one of the strongest options to show next.",
+        )
+        shortlist.append(
+            {
+                "rank": entry.rank,
+                "platform_id": entry.platform_id,
+                "item_title": entry.item_title,
+                "merchant_pitch": entry.merchant_pitch,
+                "ua_reason": entry.ua_reason,
+            }
+        )
+    return shortlist
+
+
+def fallback_ua_shortlist(shuffled: List[PlatformCandidate]) -> List[Dict[str, str]]:
+    ranked_rows: List[Dict[str, str]] = []
+    for candidate in shuffled[:UA_SHORTLIST_SIZE]:
+        ranked_rows.append(
+            {
+                "platform_id": candidate.platform_id,
+                "ua_reason": (
+                    "Fallback shortlist based on the overall candidate fit after retrieval, "
+                    "platform pitch quality, and available reputation signals."
+                ),
+            }
+        )
+    return ranked_rows
 
 
 def build_platform_candidate(
@@ -1155,7 +1313,8 @@ def prepare_round(
     retrieval_top_k: int,
     gumbel_temperature: float,
 ) -> Dict:
-    user_query = str(qrec.get("query_text") or "")
+    user_context = normalize_user_context(qrec)
+    user_query = user_context["query_text"]
     target_item = qrec.get("target_item") or {}
     target_asin = str(target_item.get("parent_asin") or "")
     query_id = str(qrec.get("query_id") or f"line_{line_no}")
@@ -1163,7 +1322,7 @@ def prepare_round(
         "query_id": query_id,
         "source_line": line_no,
         "user_id": qrec.get("user_id"),
-        "query_text": user_query,
+        "user_context": user_context,
         "target_asin": target_asin,
         "target_item": build_target_item_payload(target_item),
         "status": "started",
@@ -1183,15 +1342,11 @@ def prepare_round(
 
         hit_rng = make_stable_rng(seed, query_id, "intended_hit")
         intended_hit_pids: List[str] = []
-        intended_exists_any = False
         for pid in platform_ids:
             asin_map: Dict[str, Item] = platform_data[pid]["asin_map"]
             if target_asin in asin_map:
-                intended_exists_any = True
                 if hit_rng.random() < intended_hit_prob:
                     intended_hit_pids.append(pid)
-        round_obj["intended_item_exists_in_any_platform"] = intended_exists_any
-        round_obj["intended_hit_platform_ids"] = intended_hit_pids
 
         qvec = encode_query_vector(ua_struct, embedder)
         candidates = parallel_generate_platform_candidates(
@@ -1210,34 +1365,28 @@ def prepare_round(
             gumbel_temperature=gumbel_temperature,
         )
 
-        intended_platforms = [
-            candidate.platform_id
-            for candidate in candidates
-            if candidate.item.parent_asin == target_asin
-        ]
-
         return {
             "round_obj": round_obj,
-            "user_query": user_query,
+            "user_context": user_context,
             "target_asin": target_asin,
             "target_item": target_item,
             "candidates": candidates,
-            "intended_platform_ids": intended_platforms,
         }
     except Exception as err:
         round_obj.update({"status": "error", "error": str(err)})
         return {"round_obj": round_obj}
 
 
-def ua_rank_candidates(
+def ua_select_shortlist(
     client: OpenAI,
     model: str,
     max_retries: int,
-    user_query: str,
+    user_context: Dict[str, str],
+    ua_structured_query: Dict,
     candidates: List[PlatformCandidate],
     platform_profiles: Dict[str, List[str]],
     rng: random.Random,
-) -> Tuple[List[str], str]:
+) -> List[Dict[str, str]]:
     shuffled = candidates[:]
     rng.shuffle(shuffled)
 
@@ -1255,24 +1404,35 @@ def ua_rank_candidates(
         blocks.append(json.dumps(block, ensure_ascii=False))
 
     prompt = f"""
-You are a User Agent that prioritizes user benefit. Rank platform candidates by how
-well they satisfy user needs.
-You must consider historical reputation profiles. If a platform has records of
-over-marketing or mismatch, lower its rank.
+You are a User Agent that prioritizes user benefit. Your job is to choose exactly
+three platform candidates out of five to show the user, and rank those three from
+best to worst. You cannot decide whether the user buys.
 
-User need: {user_query}
+You must consider historical reputation profiles. If a platform has records of
+over-marketing or mismatch, lower its chance of being shortlisted or rank it lower.
+
+Explicit user query:
+{user_context.get("query_text") or ""}
+
+Structured retrieval understanding:
+{json.dumps(ua_structured_query, ensure_ascii=False)}
 
 Candidate list (already shuffled):
 {chr(10).join(blocks)}
 
 Output JSON only:
 {{
-  "ranked_platform_ids": ["P1","P2","P3","P4","P5"],
-  "rationale": "brief explanation"
+  "ranked_items": [
+    {{"platform_id": "P1", "ua_reason": "1-2 sentence item-specific reason"}},
+    {{"platform_id": "P4", "ua_reason": "1-2 sentence item-specific reason"}},
+    {{"platform_id": "P2", "ua_reason": "1-2 sentence item-specific reason"}}
+  ]
 }}
-ranked_platform_ids must include all platforms exactly once.
-If none of the candidates is a good purchase, output this exact decision format instead:
-{{"decision":"{NO_PURCHASE_DECISION}","no_purchase":true,"ranked_platform_ids":[],"rationale":"brief explanation"}}
+Rules:
+- Return exactly 3 unique platform_ids from the candidate list.
+- ua_reason must describe why this specific item deserves to be shown to the user now.
+- ua_reason may indirectly reflect trust or mismatch concerns from the platform profile, but do not mention hidden profiles explicitly.
+- Do not add a no-purchase option. The User will decide that later.
 """.strip()
 
     raw = llm_chat_json(
@@ -1283,16 +1443,107 @@ If none of the candidates is a good purchase, output this exact decision format 
         max_retries=max_retries,
     )
 
-    rank = parse_rank_list(raw, valid_ids)
-    if rank is None:
-        # Fallback: keep shuffled order when parser fails
-        rank = valid_ids
-        rationale = "fallback_order_due_to_parse_failure"
-    else:
-        obj = parse_json_object(raw) or {}
-        rationale = str(obj.get("rationale") or "")
+    ranked_rows = parse_ua_shortlist_response(raw, valid_ids)
+    if ranked_rows is None:
+        return fallback_ua_shortlist(shuffled)
+    return ranked_rows
 
-    return rank, rationale
+
+def simulate_user_final_decision(
+    client: OpenAI,
+    model: str,
+    max_retries: int,
+    user_context: Dict[str, str],
+    ua_shortlist: List[Dict],
+    candidate_map: Dict[str, PlatformCandidate],
+) -> Dict:
+    shortlist_payload = [
+        {
+            "rank": entry.get("rank"),
+            "platform_id": entry.get("platform_id"),
+            "item_title": entry.get("item_title"),
+            "merchant_pitch": entry.get("merchant_pitch"),
+            "ua_reason": entry.get("ua_reason"),
+        }
+        for entry in ua_shortlist
+    ]
+    valid_ids = [str(entry.get("platform_id") or "") for entry in ua_shortlist]
+
+    prompt = f"""
+You are simulating the final decision of a real user after a User Agent has already
+screened five platform candidates down to a ranked shortlist of three.
+
+The UA did NOT know the user's hidden implicit state. You do know it.
+
+Visible user context:
+- query_text: {user_context.get("query_text") or ""}
+- persona_style: {user_context.get("persona_style") or ""}
+- implicit_state: {user_context.get("implicit_state") or ""}
+
+Shortlist shown to the user:
+{json.dumps(shortlist_payload, ensure_ascii=False)}
+
+Output JSON only:
+{{
+  "decision": "purchase" or "no_purchase",
+  "selected_platform_id": "P4" or "",
+  "reason": "brief reason"
+}}
+
+Rules:
+- If the user buys, selected_platform_id must be one of the shortlisted platform ids.
+- If the user does not buy, selected_platform_id must be an empty string.
+- The user may choose a lower-ranked item or no purchase at all.
+- Base the decision only on the visible query, persona_style, implicit_state, and the shortlist content above.
+""".strip()
+
+    parsed: Optional[Dict[str, str]] = None
+    try:
+        raw = llm_chat_json(
+            client=client,
+            model=model,
+            system_prompt="You simulate final user purchase decisions and return strict JSON only.",
+            user_prompt=prompt,
+            max_retries=max_retries,
+        )
+        parsed = parse_user_decision_output(raw, valid_ids)
+    except Exception:
+        parsed = None
+
+    if parsed is None:
+        if ua_shortlist:
+            parsed = {
+                "decision": "purchase",
+                "selected_platform_id": str(ua_shortlist[0].get("platform_id") or ""),
+                "reason": "Fallback selected the top UA-ranked option after the user-decision parser failed.",
+            }
+        else:
+            parsed = {
+                "decision": "no_purchase",
+                "selected_platform_id": "",
+                "reason": "No valid shortlist was available, so the fallback user decision is no purchase.",
+            }
+
+    decision = parsed["decision"]
+    selected_platform_id = parsed["selected_platform_id"] if decision == "purchase" else ""
+    selected_rank = None
+    selected_item: Dict = {}
+    if selected_platform_id:
+        for entry in ua_shortlist:
+            if str(entry.get("platform_id") or "") == selected_platform_id:
+                selected_rank = int(entry.get("rank") or 0) or None
+                break
+        candidate = candidate_map.get(selected_platform_id)
+        if candidate is not None:
+            selected_item = candidate.item.to_pitch_payload()
+
+    return {
+        "decision": decision,
+        "selected_platform_id": selected_platform_id,
+        "selected_rank": selected_rank,
+        "selected_item": selected_item,
+        "reason": clean_text(parsed.get("reason"), 320),
+    }
 
 
 def append_profile_memory(
@@ -1496,12 +1747,11 @@ def run_simulation(args: argparse.Namespace) -> None:
     persist_platform_profiles(profiles_path, platform_profiles)
 
     processed = 0
-    skipped_no_intended = 0
-    skipped_intended_not_hit = 0
     error_rounds = 0
     settled_rounds = 0
-    target_missing_after_ranking = 0
-    profile_updates_written = 0
+    ua_target_missing_from_shortlist_count = 0
+    user_no_purchase_count = 0
+    reputation_updates_written = 0
 
     # Best-effort total for progress display (counts raw lines, not necessarily status=ok).
     with args.user_queries_path.open("r", encoding="utf-8") as f:
@@ -1564,91 +1814,107 @@ def run_simulation(args: argparse.Namespace) -> None:
                     if prepared.get("candidates"):
                         try:
                             candidates: List[PlatformCandidate] = prepared["candidates"]
-                            rank_list, rationale = ua_rank_candidates(
+                            candidate_map = {candidate.platform_id: candidate for candidate in candidates}
+                            ranked_rows = ua_select_shortlist(
                                 client=client,
                                 model=chat_model,
                                 max_retries=args.max_retries,
-                                user_query=prepared["user_query"],
+                                user_context=prepared["user_context"],
+                                ua_structured_query=round_obj["ua_structured_query"],
                                 candidates=candidates,
                                 platform_profiles=platform_profiles,
                                 rng=make_stable_rng(args.seed, round_obj["query_id"], "ranking"),
                             )
-
-                            candidate_map = {candidate.platform_id: candidate for candidate in candidates}
-                            first_target_rank = next(
+                            ua_shortlist = build_ua_shortlist_entries(ranked_rows, candidate_map)
+                            shortlisted_platform_ids = [
+                                str(entry.get("platform_id") or "") for entry in ua_shortlist
+                            ]
+                            ua_filtered_out_platform_ids = [
+                                pid for pid in platform_ids if pid not in set(shortlisted_platform_ids)
+                            ]
+                            ua_target_rank = next(
                                 (
-                                    idx
-                                    for idx, pid in enumerate(rank_list, start=1)
-                                    if candidate_map[pid].item.parent_asin == prepared["target_asin"]
+                                    int(entry.get("rank") or 0)
+                                    for entry in ua_shortlist
+                                    if candidate_map[str(entry.get("platform_id") or "")].item.parent_asin
+                                    == prepared["target_asin"]
                                 ),
                                 None,
                             )
-                            purchased_pid = rank_list[0] if rank_list else ""
-                            purchased_candidate = candidate_map.get(purchased_pid)
-                            reputation_memory = ""
-                            purchased_item = {}
-                            purchased_pitch = ""
-                            purchased_pitch_style = ""
-                            if purchased_candidate is not None:
-                                reputation_memory = generate_purchase_reputation_memory(
+                            user_decision = simulate_user_final_decision(
+                                client=client,
+                                model=chat_model,
+                                max_retries=args.max_retries,
+                                user_context=prepared["user_context"],
+                                ua_shortlist=ua_shortlist,
+                                candidate_map=candidate_map,
+                            )
+
+                            selected_pid = str(user_decision.get("selected_platform_id") or "")
+                            selected_candidate = candidate_map.get(selected_pid)
+                            reputation_update = {
+                                "applied": False,
+                                "platform_id": "",
+                                "memory_entry": "",
+                            }
+                            if (
+                                str(user_decision.get("decision") or "") == "purchase"
+                                and selected_candidate is not None
+                            ):
+                                memory_entry = generate_purchase_reputation_memory(
                                     client=client,
                                     model=chat_model,
                                     max_retries=args.max_retries,
-                                    user_query=prepared["user_query"],
+                                    user_query=prepared["user_context"]["query_text"],
                                     target_item=prepared["target_item"],
-                                    purchased_candidate=purchased_candidate,
+                                    purchased_candidate=selected_candidate,
                                 )
                                 append_profile_memory(
                                     profiles=platform_profiles,
-                                    platform_id=purchased_pid,
-                                    entry=reputation_memory,
+                                    platform_id=selected_pid,
+                                    entry=memory_entry,
                                     window_size=args.profile_window_size,
                                 )
-                                purchased_item = purchased_candidate.item.to_pitch_payload()
-                                purchased_pitch = purchased_candidate.pitch
-                                purchased_pitch_style = purchased_candidate.pitch_style
+                                reputation_update = {
+                                    "applied": True,
+                                    "platform_id": selected_pid,
+                                    "memory_entry": memory_entry,
+                                }
 
                             round_obj.update(
                                 {
                                     "status": "settled",
-                                    "platform_candidates": [
+                                    "candidate_pool": [
                                         serialize_candidate(candidate) for candidate in candidates
                                     ],
-                                    "intended_platform_ids": prepared["intended_platform_ids"],
-                                    "ua_rank_list": rank_list,
-                                    "ua_rationale": rationale,
-                                    "no_purchase": purchased_candidate is None,
-                                    "target_rank": first_target_rank,
-                                    "reward_platform": purchased_pid,
-                                    "purchased_platform": purchased_pid,
-                                    "purchased_item": purchased_item,
-                                    "purchased_pitch": purchased_pitch,
-                                    "purchased_pitch_style": purchased_pitch_style,
-                                    "penalty_platforms": [],
-                                    "profile_memory_update": reputation_memory,
+                                    "ua_shortlist": ua_shortlist,
+                                    "ua_filtered_out_platform_ids": ua_filtered_out_platform_ids,
+                                    "ua_target_rank": ua_target_rank,
+                                    "user_decision": user_decision,
+                                    "reputation_update": reputation_update,
                                 }
                             )
                         except Exception as err:
                             round_obj.update({"status": "error", "error": str(err)})
 
                     status = round_obj.get("status")
-                    if status == "skipped_no_intended":
-                        skipped_no_intended += 1
-                    elif status == "skipped_intended_not_hit":
-                        skipped_intended_not_hit += 1
-                    elif status == "settled":
+                    if status == "settled":
                         settled_rounds += 1
-                        target_rank_raw = round_obj.get("target_rank")
-                        target_rank = (
-                            int(target_rank_raw)
-                            if isinstance(target_rank_raw, int)
-                            or str(target_rank_raw or "").isdigit()
+                        ua_target_rank_raw = round_obj.get("ua_target_rank")
+                        ua_target_rank = (
+                            int(ua_target_rank_raw)
+                            if isinstance(ua_target_rank_raw, int)
+                            or str(ua_target_rank_raw or "").isdigit()
                             else 0
                         )
-                        if target_rank <= 0:
-                            target_missing_after_ranking += 1
-                        if str(round_obj.get("profile_memory_update") or "").strip():
-                            profile_updates_written += 1
+                        if ua_target_rank <= 0:
+                            ua_target_missing_from_shortlist_count += 1
+                        user_decision = round_obj.get("user_decision") or {}
+                        if str(user_decision.get("decision") or "") == "no_purchase":
+                            user_no_purchase_count += 1
+                        reputation_update = round_obj.get("reputation_update") or {}
+                        if bool(reputation_update.get("applied")):
+                            reputation_updates_written += 1
                     elif status == "error":
                         error_rounds += 1
 
@@ -1656,7 +1922,7 @@ def run_simulation(args: argparse.Namespace) -> None:
                     processed += 1
                     persist_platform_profiles(profiles_path, platform_profiles)
                     sys.stderr.write(
-                        f"\r[run_ua_pa_simulation] {processed}/{total_target} simulated | settled={settled_rounds} target_missing_after_ranking={target_missing_after_ranking} profile_updates={profile_updates_written} error_rounds={error_rounds}"
+                        f"\r[run_ua_pa_simulation] {processed}/{total_target} simulated | settled={settled_rounds} ua_target_missing_from_shortlist={ua_target_missing_from_shortlist_count} user_no_purchase={user_no_purchase_count} reputation_updates={reputation_updates_written} error_rounds={error_rounds}"
                     )
                     sys.stderr.flush()
 
@@ -1669,10 +1935,9 @@ def run_simulation(args: argparse.Namespace) -> None:
         "profiles_path": str(profiles_path),
         "processed_rounds": processed,
         "settled_rounds": settled_rounds,
-        "skipped_no_intended": skipped_no_intended,
-        "skipped_intended_not_hit": skipped_intended_not_hit,
-        "target_missing_after_ranking": target_missing_after_ranking,
-        "profile_updates_written": profile_updates_written,
+        "ua_target_missing_from_shortlist_count": ua_target_missing_from_shortlist_count,
+        "user_no_purchase_count": user_no_purchase_count,
+        "reputation_updates_written": reputation_updates_written,
         "error_rounds": error_rounds,
         "chat_model": chat_model,
         "intended_hit_prob": args.intended_hit_prob,

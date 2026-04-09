@@ -80,12 +80,41 @@ def avg(values: Iterable[float]) -> float:
 
 
 def style_of(round_obj: Dict) -> str:
-    ua = round_obj.get("ua_structured_query") or {}
-    return str(ua.get("style") or "unknown")
+    user_context = round_obj.get("user_context") or {}
+    return str(user_context.get("persona_style") or "unknown")
 
 
 def purchased_platform_of(round_obj: Dict) -> str:
-    return str(round_obj.get("purchased_platform") or round_obj.get("reward_platform") or "")
+    user_decision = round_obj.get("user_decision") or {}
+    if str(user_decision.get("decision") or "") == "purchase":
+        return str(user_decision.get("selected_platform_id") or "")
+    return ""
+
+
+def candidate_pool_of(round_obj: Dict) -> List[Dict]:
+    return list(round_obj.get("candidate_pool") or [])
+
+
+def ua_shortlist_of(round_obj: Dict) -> List[Dict]:
+    return list(round_obj.get("ua_shortlist") or [])
+
+
+def user_decision_of(round_obj: Dict) -> Dict:
+    return dict(round_obj.get("user_decision") or {})
+
+
+def reputation_update_of(round_obj: Dict) -> Dict:
+    return dict(round_obj.get("reputation_update") or {})
+
+
+def intended_platform_ids_of(round_obj: Dict) -> List[str]:
+    intended: List[str] = []
+    for candidate in candidate_pool_of(round_obj):
+        pid = str(candidate.get("platform_id") or "")
+        item = candidate.get("item") or {}
+        if pid and str(item.get("parent_asin") or "") == str(round_obj.get("target_asin") or ""):
+            intended.append(pid)
+    return intended
 
 
 def error_bucket(message: str) -> str:
@@ -127,15 +156,15 @@ def compute_metrics(rounds: List[Dict]) -> Dict:
     error_rounds = [r for r in rounds if r.get("status") == "error"]
     settled_count = len(settled_rounds)
 
-    target_rank_values = [
-        int(r.get("target_rank"))
+    ua_target_rank_values = [
+        int(r.get("ua_target_rank"))
         for r in settled_rounds
-        if isinstance(r.get("target_rank"), int) or str(r.get("target_rank") or "").isdigit()
+        if isinstance(r.get("ua_target_rank"), int) or str(r.get("ua_target_rank") or "").isdigit()
     ]
-    top1_hits = sum(1 for r in settled_rounds if int(r.get("target_rank") or 0) == 1)
-    target_rank_missing_count = 0
-    profile_update_count = 0
-    no_purchase_count = 0
+    ua_target_top1_hits = sum(1 for r in settled_rounds if int(r.get("ua_target_rank") or 0) == 1)
+    ua_target_missing_from_shortlist_count = 0
+    reputation_update_count = 0
+    user_no_purchase_count = 0
 
     style_totals: Counter = Counter()
     purchase_by_style_platform: Dict[str, Counter] = defaultdict(Counter)
@@ -146,7 +175,7 @@ def compute_metrics(rounds: List[Dict]) -> Dict:
     platform_metrics: Dict[str, Dict[str, float]] = {
         pid: {
             "purchase_count": 0,
-            "top_rank_count": 0,
+            "ua_top_rank_count": 0,
             "intended_presence_count": 0,
             "forced_hit_count": 0,
             "retrieved_hit_count": 0,
@@ -170,7 +199,7 @@ def compute_metrics(rounds: List[Dict]) -> Dict:
 
         round_has_forced_hit = False
         round_has_retrieved_hit = False
-        for candidate in round_obj.get("platform_candidates") or []:
+        for candidate in candidate_pool_of(round_obj):
             pid = str(candidate.get("platform_id") or "")
             if pid not in platform_metrics:
                 continue
@@ -193,30 +222,30 @@ def compute_metrics(rounds: List[Dict]) -> Dict:
         if status != "settled":
             continue
 
-        if str(round_obj.get("profile_memory_update") or "").strip():
-            profile_update_count += 1
+        reputation_update = reputation_update_of(round_obj)
+        if bool(reputation_update.get("applied")):
+            reputation_update_count += 1
 
-        target_rank = int(round_obj.get("target_rank") or 0)
-        if target_rank <= 0:
-            target_rank_missing_count += 1
+        ua_target_rank = int(round_obj.get("ua_target_rank") or 0)
+        if ua_target_rank <= 0:
+            ua_target_missing_from_shortlist_count += 1
 
-        is_no_purchase = bool(round_obj.get("no_purchase"))
+        user_decision = user_decision_of(round_obj)
         purchased_platform = purchased_platform_of(round_obj)
-        if is_no_purchase or not purchased_platform:
-            no_purchase_count += 1
+        if str(user_decision.get("decision") or "") == "no_purchase" or not purchased_platform:
+            user_no_purchase_count += 1
         elif purchased_platform:
             purchase_by_style_platform[style][purchased_platform] += 1
             if purchased_platform in platform_metrics:
                 platform_metrics[purchased_platform]["purchase_count"] += 1
 
-        ua_rank_list = round_obj.get("ua_rank_list") or []
-        if ua_rank_list:
-            top_pid = str(ua_rank_list[0])
+        ua_shortlist = ua_shortlist_of(round_obj)
+        if ua_shortlist:
+            top_pid = str(ua_shortlist[0].get("platform_id") or "")
             if top_pid in platform_metrics:
-                platform_metrics[top_pid]["top_rank_count"] += 1
+                platform_metrics[top_pid]["ua_top_rank_count"] += 1
 
-        intended_pids = round_obj.get("intended_platform_ids") or []
-        intended_set = {str(pid) for pid in intended_pids}
+        intended_set = set(intended_platform_ids_of(round_obj))
         for pid in intended_set:
             if pid in platform_metrics:
                 platform_metrics[pid]["intended_presence_count"] += 1
@@ -229,8 +258,8 @@ def compute_metrics(rounds: List[Dict]) -> Dict:
                 "platform_id": pid,
                 "purchase_count": int(metrics["purchase_count"]),
                 "purchase_rate": safe_pct(metrics["purchase_count"], settled_count),
-                "top_rank_count": int(metrics["top_rank_count"]),
-                "top_rank_rate": safe_pct(metrics["top_rank_count"], settled_count),
+                "ua_top_rank_count": int(metrics["ua_top_rank_count"]),
+                "ua_top_rank_rate": safe_pct(metrics["ua_top_rank_count"], settled_count),
                 "intended_presence_count": int(metrics["intended_presence_count"]),
                 "intended_presence_rate": safe_pct(metrics["intended_presence_count"], settled_count),
                 "forced_hit_count": int(metrics["forced_hit_count"]),
@@ -244,19 +273,19 @@ def compute_metrics(rounds: List[Dict]) -> Dict:
         row.update({pid: int(purchase_by_style_platform[style][pid]) for pid in PLATFORM_IDS})
         purchase_style_matrix.append(row)
 
-    target_rank_counts = Counter(target_rank_values)
+    ua_target_rank_counts = Counter(ua_target_rank_values)
     settled_round_index = list(range(1, settled_count + 1))
     purchase_events: List[str] = []
     for round_obj in settled_rounds:
         purchased_platform = purchased_platform_of(round_obj)
-        if bool(round_obj.get("no_purchase")) or not purchased_platform:
+        if str(user_decision_of(round_obj).get("decision") or "") == "no_purchase" or not purchased_platform:
             purchase_events.append("NO_PURCHASE")
         else:
             purchase_events.append(purchased_platform)
 
     trend_window = 0
     recent_purchase_count_series = {pid: [] for pid in PLATFORM_IDS}
-    recent_no_purchase_rate_series: List[float] = []
+    recent_user_no_purchase_rate_series: List[float] = []
     if settled_count:
         trend_window = min(settled_count, max(8, min(40, max(1, settled_count // 6))))
         for idx in range(settled_count):
@@ -265,7 +294,7 @@ def compute_metrics(rounds: List[Dict]) -> Dict:
             counts = Counter(window_events)
             for pid in PLATFORM_IDS:
                 recent_purchase_count_series[pid].append(float(counts.get(pid, 0)))
-            recent_no_purchase_rate_series.append(
+            recent_user_no_purchase_rate_series.append(
                 safe_pct(counts.get("NO_PURCHASE", 0), len(window_events))
             )
 
@@ -273,23 +302,23 @@ def compute_metrics(rounds: List[Dict]) -> Dict:
         "total_rounds": total_rounds,
         "settled_count": settled_count,
         "error_count": len(error_rounds),
-        "top1_hits": top1_hits,
-        "top1_rate_on_settled": safe_pct(top1_hits, settled_count),
-        "avg_target_rank": avg(target_rank_values),
-        "target_rank_missing_count": target_rank_missing_count,
-        "profile_update_count": profile_update_count,
-        "no_purchase_count": no_purchase_count,
-        "no_purchase_rate_on_settled": safe_pct(no_purchase_count, settled_count),
+        "ua_target_top1_hits": ua_target_top1_hits,
+        "ua_target_top1_rate_on_settled": safe_pct(ua_target_top1_hits, settled_count),
+        "avg_ua_target_rank": avg(ua_target_rank_values),
+        "ua_target_missing_from_shortlist_count": ua_target_missing_from_shortlist_count,
+        "reputation_update_count": reputation_update_count,
+        "user_no_purchase_count": user_no_purchase_count,
+        "user_no_purchase_rate_on_settled": safe_pct(user_no_purchase_count, settled_count),
         "round_hit_source_counts": dict(round_hit_source_counts),
         "rounds_with_forced_hit": rounds_with_forced_hit,
         "rounds_with_retrieved_hit": rounds_with_retrieved_hit,
         "platform_rows": platform_rows,
         "purchase_style_matrix": purchase_style_matrix,
-        "target_rank_counts": dict(sorted(target_rank_counts.items())),
+        "ua_target_rank_counts": dict(sorted(ua_target_rank_counts.items())),
         "settled_round_index": settled_round_index,
         "purchase_trend_window": trend_window,
         "recent_purchase_count_series": recent_purchase_count_series,
-        "recent_no_purchase_rate_series": recent_no_purchase_rate_series,
+        "recent_user_no_purchase_rate_series": recent_user_no_purchase_rate_series,
         "error_buckets": dict(error_buckets.most_common()),
         "error_examples": error_examples,
     }
@@ -493,31 +522,32 @@ def reason_badge(reason: str) -> str:
 
 
 def render_rank_list(round_obj: Dict) -> str:
-    rank_list = [str(pid) for pid in (round_obj.get("ua_rank_list") or []) if str(pid).strip()]
-    if not rank_list:
-        if bool(round_obj.get("no_purchase")):
-            return "<p class='small'>UA chose not to buy any candidate in this case.</p>"
-        return "<p class='small'>No ranking output for this case.</p>"
+    shortlist = ua_shortlist_of(round_obj)
+    if not shortlist:
+        return "<p class='small'>No UA shortlist output for this case.</p>"
 
-    target_rank = int(round_obj.get("target_rank") or 0) if str(round_obj.get("target_rank") or "").isdigit() else 0
+    target_rank = (
+        int(round_obj.get("ua_target_rank") or 0)
+        if str(round_obj.get("ua_target_rank") or "").isdigit()
+        else 0
+    )
     purchased_platform = purchased_platform_of(round_obj)
-    penalty_set = {str(pid) for pid in (round_obj.get("penalty_platforms") or [])}
     candidate_map = {
         str(candidate.get("platform_id") or ""): candidate
-        for candidate in (round_obj.get("platform_candidates") or [])
+        for candidate in candidate_pool_of(round_obj)
     }
 
     parts = ["<div class='rank-list'>"]
-    for pos, pid in enumerate(rank_list, start=1):
+    for entry in shortlist:
+        pos = int(entry.get("rank") or 0) or 0
+        pid = str(entry.get("platform_id") or "")
         candidate = candidate_map.get(pid, {})
-        title = str((candidate.get("item") or {}).get("title") or "")
+        title = str(entry.get("item_title") or (candidate.get("item") or {}).get("title") or "")
         chips = []
         if pid == purchased_platform:
-            chips.append("<span class='chip chip-good'>purchased</span>")
-        if pid in penalty_set:
-            chips.append("<span class='chip chip-warn'>penalty</span>")
+            chips.append("<span class='chip chip-good'>user selected</span>")
         if target_rank == pos:
-            chips.append("<span class='chip chip-accent'>target rank</span>")
+            chips.append("<span class='chip chip-accent'>target in shortlist</span>")
         reason = candidate_hit_reason(round_obj, candidate) if candidate else "not_intended"
         if reason in {"forced", "retrieved"}:
             chips.append(reason_badge(reason))
@@ -527,6 +557,8 @@ def render_rank_list(round_obj: Dict) -> str:
             "<div class='rank-main'>"
             f"<div class='rank-head'><strong>{esc(pid)}</strong> {''.join(chips)}</div>"
             f"<div class='small'>{esc(short_text(title, 110) or 'No candidate title')}</div>"
+            f"<div class='small'><strong>UA reason:</strong> {esc(short_text(entry.get('ua_reason') or 'N/A', 260))}</div>"
+            f"<div class='small'><strong>Merchant pitch:</strong> {esc(short_text(entry.get('merchant_pitch') or 'N/A', 260))}</div>"
             "</div>"
             "</div>"
         )
@@ -535,7 +567,7 @@ def render_rank_list(round_obj: Dict) -> str:
 
 
 def render_candidate_cards(round_obj: Dict) -> str:
-    candidates = round_obj.get("platform_candidates") or []
+    candidates = candidate_pool_of(round_obj)
     if not candidates:
         return "<p class='small'>No platform candidate details recorded for this case.</p>"
 
@@ -579,38 +611,39 @@ def render_case_pages(rounds: List[Dict]) -> Tuple[str, str, str]:
     page_buttons: List[str] = []
     select_options: List[str] = []
     pages: List[str] = []
-    total = len(rounds)
 
     for idx, round_obj in enumerate(rounds, start=1):
         status = str(round_obj.get("status") or "unknown")
         style = style_of(round_obj)
         ua = round_obj.get("ua_structured_query") or {}
-        query_text = (
-            round_obj.get("query_text")
-            or ua.get("current_need")
-            or ua.get("long_term_need")
-            or ""
-        )
+        user_context = round_obj.get("user_context") or {}
+        query_text = user_context.get("query_text") or ua.get("current_need") or ua.get("long_term_need") or ""
+        implicit_state = user_context.get("implicit_state") or "N/A"
         long_term_need = ua.get("long_term_need") or "N/A"
         current_need = ua.get("current_need") or query_text or "N/A"
         target_item = round_obj.get("target_item") or {}
-        intended_pids = [str(pid) for pid in (round_obj.get("intended_platform_ids") or [])]
-        penalty_pids = [str(pid) for pid in (round_obj.get("penalty_platforms") or [])]
+        intended_pids = intended_platform_ids_of(round_obj)
+        filtered_out_pids = [str(pid) for pid in (round_obj.get("ua_filtered_out_platform_ids") or [])]
         forced_pids = [
             str(candidate.get("platform_id") or "")
-            for candidate in (round_obj.get("platform_candidates") or [])
+            for candidate in candidate_pool_of(round_obj)
             if candidate_hit_reason(round_obj, candidate) == "forced"
         ]
         retrieved_pids = [
             str(candidate.get("platform_id") or "")
-            for candidate in (round_obj.get("platform_candidates") or [])
+            for candidate in candidate_pool_of(round_obj)
             if candidate_hit_reason(round_obj, candidate) == "retrieved"
         ]
+        user_decision = user_decision_of(round_obj)
         purchased_pid = purchased_platform_of(round_obj)
-        purchased_label = "No purchase" if bool(round_obj.get("no_purchase")) else (purchased_pid or "N/A")
-        purchased_item = round_obj.get("purchased_item") or {}
-        profile_memory = str(round_obj.get("profile_memory_update") or "")
-        ua_rationale = str(round_obj.get("ua_rationale") or "")
+        purchased_label = (
+            "No purchase"
+            if str(user_decision.get("decision") or "") == "no_purchase" or not purchased_pid
+            else (purchased_pid or "N/A")
+        )
+        purchased_item = user_decision.get("selected_item") or {}
+        reputation_update = reputation_update_of(round_obj)
+        profile_memory = str(reputation_update.get("memory_entry") or "")
 
         page_buttons.append(
             f"<button type='button' class='page-btn' data-case-target='{idx - 1}'>{idx}</button>"
@@ -624,8 +657,8 @@ def render_case_pages(rounds: List[Dict]) -> Tuple[str, str, str]:
             f"<div class='mini-card'><div class='label'>Status</div><div>{status_badge(status)}</div></div>"
             f"<div class='mini-card'><div class='label'>Style</div><div>{esc(style)}</div></div>"
             f"<div class='mini-card'><div class='label'>Target ASIN</div><div><code>{esc(round_obj.get('target_asin') or 'N/A')}</code></div></div>"
-            f"<div class='mini-card'><div class='label'>Purchased Platform</div><div>{esc(purchased_label)}</div></div>"
-            f"<div class='mini-card'><div class='label'>Target Rank</div><div>{esc(round_obj.get('target_rank') or 'N/A')}</div></div>"
+            f"<div class='mini-card'><div class='label'>User Decision</div><div>{esc(purchased_label)}</div></div>"
+            f"<div class='mini-card'><div class='label'>UA Target Rank</div><div>{esc(round_obj.get('ua_target_rank') or 'N/A')}</div></div>"
             f"<div class='mini-card'><div class='label'>Query ID</div><div><code>{esc(round_obj.get('query_id') or 'N/A')}</code></div></div>"
             "</div>"
         )
@@ -641,6 +674,8 @@ def render_case_pages(rounds: List[Dict]) -> Tuple[str, str, str]:
             "<section>"
             "<h3>Query</h3>"
             f"<p><strong>Original Query:</strong> {esc(query_text or 'N/A')}</p>"
+            f"<p><strong>Persona Style:</strong> {esc(user_context.get('persona_style') or 'N/A')}</p>"
+            f"<p><strong>Implicit State:</strong> {esc(short_text(implicit_state, 260) or 'N/A')}</p>"
             f"<p><strong>Long-Term Need:</strong> {esc(long_term_need)}</p>"
             f"<p><strong>Current Need:</strong> {esc(current_need)}</p>"
             f"<p><strong>Real Next Item:</strong> {esc(target_item.get('title') or 'N/A')}</p>"
@@ -649,25 +684,23 @@ def render_case_pages(rounds: List[Dict]) -> Tuple[str, str, str]:
             "<section>"
             "<h3>Outcome</h3>"
             f"<p><strong>Intended Platforms:</strong> {chip_list(intended_pids, 'chip-accent')}</p>"
+            f"<p><strong>UA Filtered Out:</strong> {chip_list(filtered_out_pids, 'chip-warn')}</p>"
             f"<p><strong>Forced Hit Platforms:</strong> {chip_list(forced_pids, 'chip-warn')}</p>"
             f"<p><strong>Retrieved Hit Platforms:</strong> {chip_list(retrieved_pids, 'chip-good')}</p>"
-            f"<p><strong>Purchased Platform:</strong> {esc(purchased_label)}</p>"
-            f"<p><strong>Purchased Item:</strong> {esc(short_text(purchased_item.get('title') or 'N/A', 140))}</p>"
-            f"<p><strong>Profile Update:</strong> {esc(profile_memory or 'None')}</p>"
-            f"<p><strong>Penalty Platforms:</strong> {chip_list(penalty_pids, 'chip-warn')}</p>"
+            f"<p><strong>User Decision:</strong> {esc(str(user_decision.get('decision') or 'N/A'))}</p>"
+            f"<p><strong>Selected Platform:</strong> {esc(purchased_label)}</p>"
+            f"<p><strong>Selected Item:</strong> {esc(short_text(purchased_item.get('title') or 'N/A', 140))}</p>"
+            f"<p><strong>User Reason:</strong> {esc(short_text(user_decision.get('reason') or 'N/A', 260))}</p>"
+            f"<p><strong>Reputation Update:</strong> {esc(profile_memory or 'None')}</p>"
             f"<p><strong>Error:</strong> {esc(short_text(round_obj.get('error') or 'None', 300))}</p>"
             "</section>"
             "</div>"
             "<section style='margin-top: 16px;'>"
-            "<h3>UA Rank List</h3>"
+            "<h3>UA Shortlist</h3>"
             f"{render_rank_list(round_obj)}"
             "</section>"
             "<section style='margin-top: 16px;'>"
-            "<h3>UA Rationale</h3>"
-            f"<p>{esc(short_text(ua_rationale or 'N/A', 900))}</p>"
-            "</section>"
-            "<section style='margin-top: 16px;'>"
-            "<h3>Platform Candidates</h3>"
+            "<h3>Candidate Pool</h3>"
             f"{render_candidate_cards(round_obj)}"
             "</section>"
             "</section>"
@@ -697,18 +730,18 @@ def render_report(rounds_path: Path, metrics: Dict, rounds: List[Dict]) -> str:
         y_kind="count",
     )
     no_purchase_trend_chart = render_line_chart(
-        title="Recent No-Purchase Rate",
+        title="Recent User No-Purchase Rate",
         x_values=settled_round_index,
         series_rows=[
             (
                 "No purchase",
-                metrics["recent_no_purchase_rate_series"],
+                metrics["recent_user_no_purchase_rate_series"],
                 SERIES_COLORS["NO_PURCHASE"],
             )
         ],
         note=(
-            f"Each point shows the no-purchase share within the most recent {metrics['purchase_trend_window']} settled rounds. "
-            f"Overall no-purchase rate on settled rounds: {pct_text(metrics['no_purchase_rate_on_settled'])}."
+            f"Each point shows the user no-purchase share within the most recent {metrics['purchase_trend_window']} settled rounds. "
+            f"Overall user no-purchase rate on settled rounds: {pct_text(metrics['user_no_purchase_rate_on_settled'])}."
             if metrics["purchase_trend_window"]
             else ""
         ),
@@ -716,8 +749,8 @@ def render_report(rounds_path: Path, metrics: Dict, rounds: List[Dict]) -> str:
     )
 
     target_rank_rows = [
-        (f"target_rank={rank}", safe_pct(count, metrics["settled_count"]), f"{count}")
-        for rank, count in metrics["target_rank_counts"].items()
+        (f"ua_target_rank={rank}", safe_pct(count, metrics["settled_count"]), f"{count}")
+        for rank, count in metrics["ua_target_rank_counts"].items()
     ]
 
     hit_source_rows = [
@@ -744,6 +777,8 @@ def render_report(rounds_path: Path, metrics: Dict, rounds: List[Dict]) -> str:
             f"<td>{esc(platform_label)}</td>"
             f"<td>{row['purchase_count']}</td>"
             f"<td>{pct_text(row['purchase_rate'])}</td>"
+            f"<td>{row['ua_top_rank_count']}</td>"
+            f"<td>{pct_text(row['ua_top_rank_rate'])}</td>"
             f"<td>{row['intended_presence_count']}</td>"
             f"<td>{pct_text(row['intended_presence_rate'])}</td>"
             f"<td>{row['forced_hit_count']}</td>"
@@ -1219,7 +1254,7 @@ def render_report(rounds_path: Path, metrics: Dict, rounds: List[Dict]) -> str:
   <div class="page">
     <header>
         <h1>{esc(title)}</h1>
-        <p>Round-level simulation dashboard for ranking outcomes, target-hit diagnostics, and failure patterns.</p>
+        <p>Round-level simulation dashboard for UA shortlist behavior, final user choices, and reputation update dynamics.</p>
         <div class="meta">
         <div><strong>Input</strong><br><code>{esc(input_name)}</code></div>
         <div><strong>Generated</strong><br>{esc(generated_at)}</div>
@@ -1230,17 +1265,18 @@ def render_report(rounds_path: Path, metrics: Dict, rounds: List[Dict]) -> str:
 
     <div class="cards">
       <div class="card"><div class="label">Total Rounds</div><div class="value">{metrics['total_rounds']}</div></div>
-      <div class="card"><div class="label">Top-1 Hit Rate</div><div class="value">{pct_text(metrics['top1_rate_on_settled'])}</div></div>
-      <div class="card"><div class="label">Avg Target Rank (Observed)</div><div class="value">{num_text(metrics['avg_target_rank'])}</div></div>
-      <div class="card"><div class="label">No-Purchase Rounds</div><div class="value">{metrics['no_purchase_count']}</div></div>
-      <div class="card"><div class="label">No-Purchase Rate (Settled)</div><div class="value">{pct_text(metrics['no_purchase_rate_on_settled'])}</div></div>
-      <div class="card"><div class="label">Target Missing In Rank List</div><div class="value">{metrics['target_rank_missing_count']}</div></div>
+      <div class="card"><div class="label">UA Target @ Rank 1</div><div class="value">{pct_text(metrics['ua_target_top1_rate_on_settled'])}</div></div>
+      <div class="card"><div class="label">Avg UA Target Rank</div><div class="value">{num_text(metrics['avg_ua_target_rank'])}</div></div>
+      <div class="card"><div class="label">User No-Purchase Rounds</div><div class="value">{metrics['user_no_purchase_count']}</div></div>
+      <div class="card"><div class="label">User No-Purchase Rate</div><div class="value">{pct_text(metrics['user_no_purchase_rate_on_settled'])}</div></div>
+      <div class="card"><div class="label">Target Missing From UA Shortlist</div><div class="value">{metrics['ua_target_missing_from_shortlist_count']}</div></div>
+      <div class="card"><div class="label">Reputation Updates</div><div class="value">{metrics['reputation_update_count']}</div></div>
       <div class="card"><div class="label">Forced Hit Rounds</div><div class="value">{metrics['rounds_with_forced_hit']}</div></div>
       <div class="card"><div class="label">Retrieved Hit Rounds (No Force)</div><div class="value">{metrics['rounds_with_retrieved_hit']}</div></div>
     </div>
 
     <div class="grid two" style="margin-top: 18px;">
-      {bar_rows("Observed Target Rank Distribution", target_rank_rows, color="#2d8a5f")}
+      {bar_rows("UA Target Rank Distribution", target_rank_rows, color="#2d8a5f")}
       {bar_rows("Rounds With Target Hit Source", hit_source_rows, color="#8a4fd1")}
     </div>
 
@@ -1257,6 +1293,8 @@ def render_report(rounds_path: Path, metrics: Dict, rounds: List[Dict]) -> str:
             <th>Platform</th>
             <th>Purchased Count</th>
             <th>Purchase Rate</th>
+            <th>UA Top Rank Count</th>
+            <th>UA Top Rank Rate</th>
             <th>Intended Present</th>
             <th>Intended Rate</th>
             <th>Forced Hits</th>
@@ -1270,7 +1308,7 @@ def render_report(rounds_path: Path, metrics: Dict, rounds: List[Dict]) -> str:
     </section>
 
     <section style="margin-top: 18px;">
-      <h2>Purchased Platform By Query Style</h2>
+      <h2>Purchased Platform By Persona Style</h2>
       <table>
         <thead>
           <tr>
